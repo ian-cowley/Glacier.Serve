@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>preview</LangVersion>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <TieredPGO>true</TieredPGO>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <NoWarn>$(NoWarn);CS1591;CS8981</NoWarn>
+
+    <!-- NuGet Package Properties -->
+    <PackageId>Glacier.Serve</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Ian Cowley</Authors>
+    <Company>Glacier High-Performance Ecosystem</Company>
+    <Description>Ultra-low-latency, Native AOT web and API microservices engine for .NET 10. Native C# alternative to Flask and FastAPI featuring SIMD HTTP delimiter scanning, zero-allocation Radix Tree routing, and direct Polaris/Tensor streaming.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/ian-cowley/Glacier.Serve</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/ian-cowley/Glacier.Serve.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>http;web;api;flask;fastapi;microservice;simd;radix-tree;arrow-ipc;pipelines;net10;aot;glacier</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Glacier.Polaris" Version="1.0.14" />
+    <PackageReference Include="Glacier.Tensor" Version="1.0.0" />
+  </ItemGroup>
+</Project>
