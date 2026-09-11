@@ -3,6 +3,7 @@ namespace Glacier.Serve.Demo;
 using System;
 using System.Diagnostics;
 using System.Net.Http;
+using System.Linq;
 using System.Threading.Tasks;
 using Glacier.Polaris;
 using Glacier.Polaris.Data;
@@ -13,7 +14,7 @@ using Glacier.Tensor.Core;
 
 public static class Program
 {
-    public static async Task Main()
+    public static async Task Main(string[] args)
     {
         Console.WriteLine("================================================================================");
         Console.WriteLine("       GLACIER.SERVE: ULTRA-LOW-LATENCY NATIVE AOT WEB ENGINE (.NET 10)         ");
@@ -112,5 +113,25 @@ public static class Program
         Console.WriteLine("================================================================================");
         Console.WriteLine("           ALL DEMOS COMPLETED SUCCESSFULLY: GLACIER.SERVE IS READY!            ");
         Console.WriteLine("================================================================================");
+
+        bool isHeadless = args.Contains("--headless") || args.Contains("--bench");
+        if (!isHeadless)
+        {
+            try
+            {
+                Console.WriteLine($"\n[Opening http://127.0.0.1:{port}/api/status in browser...]");
+                Process.Start(new ProcessStartInfo($"http://127.0.0.1:{port}/api/status") { UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"  (Could not open browser: {ex.Message})");
+            }
+
+            if (Environment.UserInteractive && !Console.IsInputRedirected)
+            {
+                Console.WriteLine($"\n[Server is LIVE at http://127.0.0.1:{port} - Press any key to stop server and exit...]");
+                Console.ReadKey();
+            }
+        }
     }
 }
