@@ -12,15 +12,15 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Serve</PackageId>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
-    <Description>Ultra-low-latency, Native AOT web and API microservices engine for .NET 10. Native C# alternative to Flask and FastAPI featuring SIMD HTTP delimiter scanning, zero-allocation Radix Tree routing, and direct Polaris/Tensor streaming.</Description>
+    <Description>Ultra-low-latency, Native AOT web and LLM inference microservices engine for .NET 10. Features PagedAttention, Continuous Iteration Batching, SIMD HTTP delimiter scanning, zero-allocation Radix Tree routing, and direct Polaris/Tensor streaming.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/ian-cowley/Glacier.Serve</PackageProjectUrl>
     <RepositoryUrl>https://github.com/ian-cowley/Glacier.Serve.git</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageTags>http;web;api;flask;fastapi;microservice;simd;radix-tree;arrow-ipc;pipelines;net10;aot;glacier</PackageTags>
+    <PackageTags>http;web;api;vllm;ollama;paged-attention;continuous-batching;llm;inference;simd;radix-tree;arrow-ipc;net10;aot;glacier</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
 
@@ -30,6 +30,8 @@
 
   <ItemGroup>
     <PackageReference Include="Glacier.Polaris" Version="1.0.14" />
-    <PackageReference Include="Glacier.Tensor" Version="1.0.0" />
+    <PackageReference Include="Glacier.Tensor" Version="1.0.6" />
+    <PackageReference Include="Glacier.Inference" Version="1.1.14" />
+    <PackageReference Include="Glacier.Gpu" Version="1.0.5" />
   </ItemGroup>
 </Project>

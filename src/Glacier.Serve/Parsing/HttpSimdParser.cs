@@ -123,28 +123,27 @@ public static class HttpSimdParser
         headerValue = default;
         bytesConsumed = 0;
 
-        int colonIdx = IndexOfByteVector256(buffer, (byte)':');
+        int eol = IndexOfCrlfVector256(buffer);
+        if (eol < 0) return false;
+
+        var line = buffer[..eol];
+        int colonIdx = IndexOfByteVector256(line, (byte)':');
         if (colonIdx <= 0) return false;
 
-        headerName = buffer[..colonIdx];
-        var valSpan = buffer[(colonIdx + 1)..];
+        headerName = line[..colonIdx];
+        var valSpan = line[(colonIdx + 1)..];
 
-        // RFC 7230 §3.2.4: Trim leading OWS (spaces and tabs)
+        // RFC 7230 §3.2.4: Trim leading OWS
         while (valSpan.Length > 0 && (valSpan[0] == (byte)' ' || valSpan[0] == (byte)'\t'))
             valSpan = valSpan[1..];
 
-        int eol = IndexOfCrlfVector256(valSpan);
-        if (eol < 0) return false;
-
-        var rawValue = valSpan[..eol];
-
         // Trim trailing OWS
-        while (rawValue.Length > 0 && (rawValue[^1] == (byte)' ' || rawValue[^1] == (byte)'\t'))
-            rawValue = rawValue[..^1];
+        while (valSpan.Length > 0 && (valSpan[^1] == (byte)' ' || valSpan[^1] == (byte)'\t'))
+            valSpan = valSpan[..^1];
 
-        headerValue = rawValue;
-        int lineEndLength = (valSpan[eol] == (byte)'\r' && valSpan.Length > eol + 1 && valSpan[eol + 1] == (byte)'\n') ? 2 : 1;
-        bytesConsumed = (colonIdx + 1) + (buffer.Length - (colonIdx + 1) - valSpan.Length) + eol + lineEndLength;
+        headerValue = valSpan;
+        int lineEndLength = (buffer[eol] == (byte)'\r' && buffer.Length > eol + 1 && buffer[eol + 1] == (byte)'\n') ? 2 : 1;
+        bytesConsumed = eol + lineEndLength;
         return true;
     }
 

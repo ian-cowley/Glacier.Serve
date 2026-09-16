@@ -133,10 +133,84 @@ public sealed class GlacierServeApp : IDisposable
                     }
                 }
 
+                if (request.Header("Transfer-Encoding")?.Contains("chunked", StringComparison.OrdinalIgnoreCase) == true)
+                {
+                    using var ms = new MemoryStream();
+                    int chunkOffset = totalConsumed;
+                    while (true)
+                    {
+                        var remainingBytes = buffer.Slice(chunkOffset).ToArray();
+                        int crlf = HttpSimdParser.IndexOfCrlfVector256(remainingBytes.AsSpan());
+                        if (crlf < 0)
+                        {
+                            reader.AdvanceTo(buffer.Start, buffer.End);
+                            readResult = await reader.ReadAsync(ct).ConfigureAwait(false);
+                            buffer = readResult.Buffer;
+                            remainingBytes = buffer.Slice(chunkOffset).ToArray();
+                            crlf = HttpSimdParser.IndexOfCrlfVector256(remainingBytes.AsSpan());
+                            if (crlf < 0) break;
+                        }
+
+                        string hexStr = Encoding.ASCII.GetString(remainingBytes, 0, crlf).Trim();
+                        if (!int.TryParse(hexStr, System.Globalization.NumberStyles.HexNumber, null, out int chunkSize))
+                            break;
+
+                        int lineEndLen = (remainingBytes[crlf] == (byte)'\r' && remainingBytes.Length > crlf + 1 && remainingBytes[crlf + 1] == (byte)'\n') ? 2 : 1;
+                        chunkOffset += crlf + lineEndLen;
+
+                        if (chunkSize == 0)
+                        {
+                            if (buffer.Length >= chunkOffset + 2) chunkOffset += 2;
+                            break;
+                        }
+
+                        while (buffer.Length < chunkOffset + chunkSize)
+                        {
+                            reader.AdvanceTo(buffer.Start, buffer.End);
+                            readResult = await reader.ReadAsync(ct).ConfigureAwait(false);
+                            buffer = readResult.Buffer;
+                        }
+
+                        var chunkBytes = buffer.Slice(chunkOffset, chunkSize).ToArray();
+                        ms.Write(chunkBytes, 0, chunkBytes.Length);
+                        chunkOffset += chunkSize;
+
+                        if (buffer.Length >= chunkOffset + 2)
+                        {
+                            var crlfCheck = buffer.Slice(chunkOffset, 2).ToArray();
+                            if (crlfCheck[0] == '\r' && crlfCheck[1] == '\n') chunkOffset += 2;
+                            else if (crlfCheck[0] == '\n') chunkOffset += 1;
+                        }
+                    }
+
+                    request.Body = ms.ToArray();
+                    totalConsumed = chunkOffset;
+                }
+                else if (request.Header("Content-Length") is string clStr && int.TryParse(clStr, out int clVal))
+                {
+                    int contentLength = clVal;
+                    while (buffer.Length < totalConsumed + contentLength)
+                    {
+                        reader.AdvanceTo(buffer.Start, buffer.End);
+                        readResult = await reader.ReadAsync(ct).ConfigureAwait(false);
+                        buffer = readResult.Buffer;
+                        if (readResult.IsCompleted && buffer.Length < totalConsumed + contentLength) break;
+                    }
+
+                    if (contentLength > 0 && buffer.Length >= totalConsumed + contentLength)
+                    {
+                        request.Body = buffer.Slice(totalConsumed, contentLength).ToArray();
+                        totalConsumed += contentLength;
+                    }
+                }
+
+                reader.AdvanceTo(buffer.GetPosition(totalConsumed));
+
                 var response = new HttpResponse(writer);
                 var context = new HttpContext(request, response, ct);
 
-                if (_router.TryMatch(method, pathSpan, out var match))
+                byte[] pathBytes = Encoding.UTF8.GetBytes(request.Path);
+                if (_router.TryMatch(method, pathBytes, out var match))
                 {
                     if (match.Parameters != null)
                     {
@@ -154,18 +228,17 @@ public sealed class GlacierServeApp : IDisposable
                     await response.WriteUtf8Async("404 Not Found").ConfigureAwait(false);
                 }
 
-                reader.AdvanceTo(buffer.GetPosition(totalConsumed));
-
-                // Check Connection header
-                if (request.Header("Connection")?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
+                // Check Connection header from request or response
+                if (request.Header("Connection")?.Equals("close", StringComparison.OrdinalIgnoreCase) == true ||
+                    response.Headers.TryGetValue("Connection", out var respConn) && respConn.Equals("close", StringComparison.OrdinalIgnoreCase))
                 {
                     break;
                 }
             }
         }
-        catch
+        catch (Exception ex)
         {
-            // Client disconnect
+            Console.Error.WriteLine($"[ProcessConnectionAsync ERROR]: {ex}");
         }
         finally
         {
