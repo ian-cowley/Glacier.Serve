@@ -29,9 +29,9 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Glacier.Polaris" Version="1.0.14" />
+    <PackageReference Include="Glacier.Polaris" Version="1.0.16" />
     <PackageReference Include="Glacier.Tensor" Version="1.0.6" />
-    <PackageReference Include="Glacier.Inference" Version="1.1.14" />
-    <PackageReference Include="Glacier.Gpu" Version="1.0.5" />
+    <PackageReference Include="Glacier.Inference" Version="1.2.0" />
+    <PackageReference Include="Glacier.Gpu" Version="1.0.6" />
   </ItemGroup>
 </Project>

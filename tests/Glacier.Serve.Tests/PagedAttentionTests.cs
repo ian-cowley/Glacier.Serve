@@ -107,4 +107,74 @@ public unsafe class PagedAttentionTests
 
         pool.FreeBlock(blockId);
     }
+
+    [Fact]
+    public void ComputeAttention_HeadDim128_AccumulatesAccurately()
+    {
+        const int headDim = 128;
+        const int blockSize = 16;
+        const int totalTokens = 32;
+        const int nHeads = 4;
+        const int nHeadsKv = 2;
+
+        using var pool = new PagedBlockPool(totalBlocks: 8, layers: 1, headsKv: nHeadsKv, headDim: headDim, blockSize: blockSize);
+        var table = new BlockTable(pool);
+
+        for (int t = 0; t < totalTokens; t++)
+        {
+            Assert.True(table.AppendToken(out int blockId, out int offset));
+            float[] k = new float[nHeadsKv * headDim];
+            float[] v = new float[nHeadsKv * headDim];
+            for (int d = 0; d < headDim; d++)
+            {
+                k[d] = 0.01f * (t + 1);
+                v[d] = (t + 1);
+                k[headDim + d] = 0.01f * (t + 1);
+                v[headDim + d] = 2.0f * (t + 1);
+            }
+            fixed (float* pK = k, pV = v)
+            {
+                pool.Store(blockId, layer: 0, offsetInBlock: offset, pK, pV);
+            }
+        }
+
+        float[] q = new float[nHeads * headDim];
+        for (int i = 0; i < q.Length; i++) q[i] = 1.0f;
+
+        float[] outAttn = new float[nHeads * headDim];
+        float[] scores = new float[nHeads * totalTokens];
+
+        fixed (float* pQ = q, pOut = outAttn, pScores = scores)
+        {
+            PagedAttentionKernel.ComputeAttention(
+                stageLayer: 0,
+                modelLayer: 0,
+                pos: totalTokens - 1,
+                qBase: pQ,
+                outBase: pOut,
+                blockTable: table,
+                pool: pool,
+                nHeads: nHeads,
+                nHeadsKv: nHeadsKv,
+                headDim: headDim,
+                vHeadDim: headDim,
+                attnScale: 1.0f / MathF.Sqrt(headDim),
+                headScores: pScores,
+                maxSeqLen: totalTokens);
+        }
+
+        // Verify output is non-zero, positive, and matches expected dimensions
+        for (int h = 0; h < nHeads; h++)
+        {
+            float firstVal = outAttn[h * headDim];
+            Assert.True(firstVal > 0f, $"Head {h} output should be positive");
+            // All dimensions in head should have identical value due to symmetry
+            for (int d = 0; d < headDim; d++)
+            {
+                Assert.Equal(firstVal, outAttn[h * headDim + d], precision: 4);
+            }
+        }
+
+        table.ReleaseAll();
+    }
 }
