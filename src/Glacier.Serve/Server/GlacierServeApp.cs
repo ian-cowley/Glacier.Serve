@@ -76,6 +76,8 @@ public sealed class GlacierServeApp : IDisposable
         var reader = PipeReader.Create(stream);
         var writer = PipeWriter.Create(stream);
 
+        byte[] pathUtf8 = new byte[1024];
+
         try
         {
             while (!ct.IsCancellationRequested)
@@ -85,52 +87,23 @@ public sealed class GlacierServeApp : IDisposable
 
                 if (buffer.IsEmpty && readResult.IsCompleted) break;
 
-                // Read continuous sequence
-                byte[] tempBytes = buffer.ToArray();
-                var span = tempBytes.AsSpan();
-
-                if (!HttpSimdParser.TryParseRequestLine(span, out var methodSpan, out var pathSpan, out int reqLineConsumed))
+                // Zero-copy network ingress parsing using ReadOnlySequence<byte> and pooled/stackalloc buffers
+                if (!TryParseRequestHeaders(buffer, out var method, out var path, out var headers, out int totalConsumed))
                 {
                     reader.AdvanceTo(buffer.Start, buffer.End);
                     if (readResult.IsCompleted) break;
                     continue;
                 }
 
-                var method = HttpSimdParser.ParseMethod(methodSpan);
                 var request = new HttpRequest
                 {
                     Method = method,
-                    Path = Encoding.UTF8.GetString(pathSpan),
+                    Path = path,
                     BodyReader = reader
                 };
-
-                // Parse headers
-                var headerSpan = span[reqLineConsumed..];
-                int totalConsumed = reqLineConsumed;
-
-                while (headerSpan.Length > 0)
+                foreach (var (k, v) in headers)
                 {
-                    if (headerSpan.StartsWith("\r\n"u8))
-                    {
-                        totalConsumed += 2;
-                        break;
-                    }
-                    if (headerSpan.StartsWith("\n"u8))
-                    {
-                        totalConsumed += 1;
-                        break;
-                    }
-
-                    if (HttpSimdParser.TryParseHeader(headerSpan, out var hName, out var hVal, out int hConsumed))
-                    {
-                        request.Headers[Encoding.UTF8.GetString(hName)] = Encoding.UTF8.GetString(hVal);
-                        totalConsumed += hConsumed;
-                        headerSpan = span[totalConsumed..];
-                    }
-                    else
-                    {
-                        break;
-                    }
+                    request.Headers[k] = v;
                 }
 
                 if (request.Header("Transfer-Encoding")?.Contains("chunked", StringComparison.OrdinalIgnoreCase) == true)
@@ -199,7 +172,17 @@ public sealed class GlacierServeApp : IDisposable
 
                     if (contentLength > 0 && buffer.Length >= totalConsumed + contentLength)
                     {
-                        request.Body = buffer.Slice(totalConsumed, contentLength).ToArray();
+                        var bodySlice = buffer.Slice(totalConsumed, contentLength);
+                        if (bodySlice.IsSingleSegment)
+                        {
+                            request.Body = bodySlice.First;
+                        }
+                        else
+                        {
+                            byte[] bodyBytes = GC.AllocateUninitializedArray<byte>(contentLength);
+                            bodySlice.CopyTo(bodyBytes);
+                            request.Body = bodyBytes;
+                        }
                         totalConsumed += contentLength;
                     }
                 }
@@ -209,8 +192,13 @@ public sealed class GlacierServeApp : IDisposable
                 var response = new HttpResponse(writer);
                 var context = new HttpContext(request, response, ct);
 
-                byte[] pathBytes = Encoding.UTF8.GetBytes(request.Path);
-                if (_router.TryMatch(method, pathBytes, out var match))
+                int pathMaxBytes = Encoding.UTF8.GetMaxByteCount(request.Path.Length);
+                if (pathMaxBytes > pathUtf8.Length)
+                {
+                    pathUtf8 = new byte[pathMaxBytes];
+                }
+                int pathBytesWritten = Encoding.UTF8.GetBytes(request.Path, pathUtf8);
+                if (_router.TryMatch(method, pathUtf8.AsSpan(0, pathBytesWritten), out var match))
                 {
                     if (match.Parameters != null)
                     {
@@ -245,6 +233,89 @@ public sealed class GlacierServeApp : IDisposable
             await reader.CompleteAsync().ConfigureAwait(false);
             await writer.CompleteAsync().ConfigureAwait(false);
         }
+    }
+
+    private static bool TryParseRequestHeaders(
+        in ReadOnlySequence<byte> buffer,
+        out HttpMethod method,
+        out string path,
+        out Dictionary<string, string> headers,
+        out int totalConsumed)
+    {
+        int maxHeaderScan = (int)Math.Min(buffer.Length, 8192);
+        if (buffer.IsSingleSegment)
+        {
+            return TryParseSpanHeaders(buffer.FirstSpan, out method, out path, out headers, out totalConsumed);
+        }
+
+        if (maxHeaderScan <= 4096)
+        {
+            Span<byte> scratch = stackalloc byte[maxHeaderScan];
+            buffer.Slice(0, maxHeaderScan).CopyTo(scratch);
+            return TryParseSpanHeaders(scratch, out method, out path, out headers, out totalConsumed);
+        }
+
+        byte[] rented = ArrayPool<byte>.Shared.Rent(maxHeaderScan);
+        try
+        {
+            buffer.Slice(0, maxHeaderScan).CopyTo(rented);
+            return TryParseSpanHeaders(rented.AsSpan(0, maxHeaderScan), out method, out path, out headers, out totalConsumed);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    private static bool TryParseSpanHeaders(
+        ReadOnlySpan<byte> span,
+        out HttpMethod method,
+        out string path,
+        out Dictionary<string, string> headers,
+        out int totalConsumed)
+    {
+        method = HttpMethod.Get;
+        path = "/";
+        headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        totalConsumed = 0;
+
+        if (!HttpSimdParser.TryParseRequestLine(span, out var methodSpan, out var pathSpan, out int reqLineConsumed))
+        {
+            return false;
+        }
+
+        method = HttpSimdParser.ParseMethod(methodSpan);
+        path = Encoding.UTF8.GetString(pathSpan);
+
+        var headerSpan = span[reqLineConsumed..];
+        totalConsumed = reqLineConsumed;
+
+        while (headerSpan.Length > 0)
+        {
+            if (headerSpan.StartsWith("\r\n"u8))
+            {
+                totalConsumed += 2;
+                return true;
+            }
+            if (headerSpan.StartsWith("\n"u8))
+            {
+                totalConsumed += 1;
+                return true;
+            }
+
+            if (HttpSimdParser.TryParseHeader(headerSpan, out var hName, out var hVal, out int hConsumed))
+            {
+                headers[Encoding.UTF8.GetString(hName)] = Encoding.UTF8.GetString(hVal);
+                totalConsumed += hConsumed;
+                headerSpan = span[totalConsumed..];
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        return false;
     }
 
     public void Stop()

@@ -12,7 +12,7 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Serve</PackageId>
-    <Version>1.1.0</Version>
+    <Version>1.1.1</Version>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
     <Description>Ultra-low-latency, Native AOT web and LLM inference microservices engine for .NET 10. Features PagedAttention, Continuous Iteration Batching, SIMD HTTP delimiter scanning, zero-allocation Radix Tree routing, and direct Polaris/Tensor streaming.</Description>
@@ -22,6 +22,8 @@
     <RepositoryType>git</RepositoryType>
     <PackageTags>http;web;api;vllm;ollama;paged-attention;continuous-batching;llm;inference;simd;radix-tree;arrow-ipc;net10;aot;glacier</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <IsAotCompatible>true</IsAotCompatible>
+    <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
   </PropertyGroup>
 
   <ItemGroup>
@@ -29,9 +31,9 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Glacier.Polaris" Version="1.0.16" />
-    <PackageReference Include="Glacier.Tensor" Version="1.0.6" />
-    <PackageReference Include="Glacier.Inference" Version="1.2.0" />
-    <PackageReference Include="Glacier.Gpu" Version="1.0.6" />
+    <PackageReference Include="Glacier.Polaris" Version="1.0.17" />
+    <PackageReference Include="Glacier.Tensor" Version="1.0.7" />
+    <PackageReference Include="Glacier.Inference" Version="1.2.2" />
+    <PackageReference Include="Glacier.Gpu" Version="1.0.7" />
   </ItemGroup>
 </Project>

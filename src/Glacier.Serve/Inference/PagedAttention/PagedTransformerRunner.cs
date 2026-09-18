@@ -26,6 +26,8 @@ public sealed unsafe class PagedTransformerRunner : IDisposable
     private readonly int _vocabSize;
     private readonly int _maxSeqLen;
 
+    private readonly int _maxBatchSize;
+
     private readonly float* _x;
     private readonly float* _normX;
     private readonly float* _normXSums;
@@ -41,13 +43,29 @@ public sealed unsafe class PagedTransformerRunner : IDisposable
     private readonly float* _ffnProj;
     private readonly float* _headScores;
 
+    // Batched activation scratch buffers for unified GEMM execution
+    private readonly float* _xBatch;
+    private readonly float* _normXBatch;
+    private readonly float* _normXSumsBatch;
+    private readonly float* _qBatch;
+    private readonly float* _kBatch;
+    private readonly float* _vBatch;
+    private readonly float* _attnOutBatch;
+    private readonly float* _attnOutSumsBatch;
+    private readonly float* _attnProjBatch;
+    private readonly float* _gateBatch;
+    private readonly float* _upBatch;
+    private readonly float* _gateSumsBatch;
+    private readonly float* _ffnProjBatch;
+
     private bool _disposed;
 
     public ModelWeights Weights => _weights;
     public int VocabSize => _vocabSize;
     public int MaxSeqLen => _maxSeqLen;
+    public int MaxBatchSize => _maxBatchSize;
 
-    public PagedTransformerRunner(ModelWeights weights, int maxSeqLen = 4096)
+    public PagedTransformerRunner(ModelWeights weights, int maxSeqLen = 4096, int maxBatchSize = 64)
     {
         _weights = weights ?? throw new ArgumentNullException(nameof(weights));
         _dim = _weights.EmbeddingLength;
@@ -60,30 +78,51 @@ public sealed unsafe class PagedTransformerRunner : IDisposable
         _layerCount = _weights.BlockCount;
         _vocabSize = _weights.VocabSize;
         _maxSeqLen = maxSeqLen;
+        _maxBatchSize = maxBatchSize > 0 ? maxBatchSize : 64;
 
         int qDim = _nHeads * _headDim;
         int kvDim = _nHeadsKv * _headDim;
         int vDim = _nHeadsKv * _vHeadDim;
         int outDim = _nHeads * _vHeadDim;
+        int sumsDim = (_dim + 31) / 32;
+        int gateSumsDim = (_ffnDim + 31) / 32;
 
         _x = (float*)NativeMemory.AllocZeroed((nuint)(_dim * sizeof(float)));
         _normX = (float*)NativeMemory.AllocZeroed((nuint)(_dim * sizeof(float)));
-        _normXSums = (float*)NativeMemory.AllocZeroed((nuint)(((_dim + 31) / 32) * sizeof(float)));
+        _normXSums = (float*)NativeMemory.AllocZeroed((nuint)(sumsDim * sizeof(float)));
 
         _q = (float*)NativeMemory.AllocZeroed((nuint)(qDim * sizeof(float)));
         _k = (float*)NativeMemory.AllocZeroed((nuint)(kvDim * sizeof(float)));
         _v = (float*)NativeMemory.AllocZeroed((nuint)(vDim * sizeof(float)));
 
         _attnOut = (float*)NativeMemory.AllocZeroed((nuint)(outDim * sizeof(float)));
-        _attnOutSums = (float*)NativeMemory.AllocZeroed((nuint)(((_dim + 31) / 32) * sizeof(float)));
+        _attnOutSums = (float*)NativeMemory.AllocZeroed((nuint)(sumsDim * sizeof(float)));
         _attnProj = (float*)NativeMemory.AllocZeroed((nuint)(_dim * sizeof(float)));
 
         _gate = (float*)NativeMemory.AllocZeroed((nuint)(_ffnDim * sizeof(float)));
         _up = (float*)NativeMemory.AllocZeroed((nuint)(_ffnDim * sizeof(float)));
-        _gateSums = (float*)NativeMemory.AllocZeroed((nuint)(((_ffnDim + 31) / 32) * sizeof(float)));
+        _gateSums = (float*)NativeMemory.AllocZeroed((nuint)(gateSumsDim * sizeof(float)));
         _ffnProj = (float*)NativeMemory.AllocZeroed((nuint)(_dim * sizeof(float)));
 
         _headScores = (float*)NativeMemory.AllocZeroed((nuint)((long)_nHeads * _maxSeqLen * sizeof(float)));
+
+        // Allocate unified batch buffers
+        _xBatch = (float*)NativeMemory.AllocZeroed((nuint)((long)_maxBatchSize * _dim * sizeof(float)));
+        _normXBatch = (float*)NativeMemory.AllocZeroed((nuint)((long)_maxBatchSize * _dim * sizeof(float)));
+        _normXSumsBatch = (float*)NativeMemory.AllocZeroed((nuint)((long)_maxBatchSize * sumsDim * sizeof(float)));
+
+        _qBatch = (float*)NativeMemory.AllocZeroed((nuint)((long)_maxBatchSize * qDim * sizeof(float)));
+        _kBatch = (float*)NativeMemory.AllocZeroed((nuint)((long)_maxBatchSize * kvDim * sizeof(float)));
+        _vBatch = (float*)NativeMemory.AllocZeroed((nuint)((long)_maxBatchSize * vDim * sizeof(float)));
+
+        _attnOutBatch = (float*)NativeMemory.AllocZeroed((nuint)((long)_maxBatchSize * outDim * sizeof(float)));
+        _attnOutSumsBatch = (float*)NativeMemory.AllocZeroed((nuint)((long)_maxBatchSize * sumsDim * sizeof(float)));
+        _attnProjBatch = (float*)NativeMemory.AllocZeroed((nuint)((long)_maxBatchSize * _dim * sizeof(float)));
+
+        _gateBatch = (float*)NativeMemory.AllocZeroed((nuint)((long)_maxBatchSize * _ffnDim * sizeof(float)));
+        _upBatch = (float*)NativeMemory.AllocZeroed((nuint)((long)_maxBatchSize * _ffnDim * sizeof(float)));
+        _gateSumsBatch = (float*)NativeMemory.AllocZeroed((nuint)((long)_maxBatchSize * gateSumsDim * sizeof(float)));
+        _ffnProjBatch = (float*)NativeMemory.AllocZeroed((nuint)((long)_maxBatchSize * _dim * sizeof(float)));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -192,6 +231,170 @@ public sealed unsafe class PagedTransformerRunner : IDisposable
         return true;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public bool ForwardBatch(
+        ReadOnlySpan<int> tokens,
+        ReadOnlySpan<int> positions,
+        IReadOnlyList<BlockTable> blockTables,
+        PagedBlockPool pool,
+        Span<float> logitsBatch,
+        Span<bool> successFlags,
+        bool computeLogits = true)
+    {
+        int batchSize = tokens.Length;
+        if (batchSize == 0) return true;
+        if (batchSize > _maxBatchSize)
+            throw new ArgumentOutOfRangeException(nameof(tokens), $"Batch size {batchSize} exceeds maximum runner capacity {_maxBatchSize}.");
+
+        int qDim = _nHeads * _headDim;
+        int kvDim = _nHeadsKv * _headDim;
+        int outDim = _nHeads * _vHeadDim;
+        int sumsDim = (_dim + 31) / 32;
+        int gateSumsDim = (_ffnDim + 31) / 32;
+
+        Span<int> pBlockIds = stackalloc int[batchSize];
+        Span<int> offsetsInBlock = stackalloc int[batchSize];
+
+        // 1. Allocate block table slots for each sequence
+        for (int b = 0; b < batchSize; b++)
+        {
+            int pos = positions[b];
+            var blockTable = blockTables[b];
+            if (pos == blockTable.TokenCount)
+            {
+                if (!blockTable.AppendToken(out int blockId, out int offset))
+                {
+                    successFlags[b] = false;
+                    pBlockIds[b] = -1;
+                    offsetsInBlock[b] = -1;
+                    continue;
+                }
+                pBlockIds[b] = blockId;
+                offsetsInBlock[b] = offset;
+                successFlags[b] = true;
+            }
+            else
+            {
+                blockTable.GetTokenLocation(pos, out int blockId, out int offset);
+                pBlockIds[b] = blockId;
+                offsetsInBlock[b] = offset;
+                successFlags[b] = true;
+            }
+        }
+
+        // 2. Extract embeddings into _xBatch
+        for (int b = 0; b < batchSize; b++)
+        {
+            if (!successFlags[b]) continue;
+            QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, tokens[b], _xBatch + b * _dim, _dim);
+        }
+
+        // 3. Layer by layer batched transformer execution
+        for (int l = 0; l < _layerCount; l++)
+        {
+            var layer = _weights.Layers[l];
+
+            // Attention pre-norm across all batch rows
+            for (int b = 0; b < batchSize; b++)
+            {
+                if (!successFlags[b]) continue;
+                QuantKernels.RMSNorm(_xBatch + b * _dim, layer.AttnNormWeight, _normXBatch + b * _dim, _dim, _weights.RmsNormEps);
+                QuantKernels.ComputeBlockSums32(_normXBatch + b * _dim, _normXSumsBatch + b * sumsDim, _dim);
+            }
+
+            // Unified Batch GEMMs: load weights ONCE, multiply across all sequences simultaneously
+            QuantKernels.MatMulBatch(layer.QType, layer.QWeight, _normXBatch, _qBatch, _dim, qDim, batchSize, _normXSumsBatch);
+            QuantKernels.MatMulBatch(layer.KType, layer.KWeight, _normXBatch, _kBatch, _dim, kvDim, batchSize, _normXSumsBatch);
+            QuantKernels.MatMulBatch(layer.VType, layer.VWeight, _normXBatch, _vBatch, _dim, kvDim, batchSize, _normXSumsBatch);
+
+            for (int b = 0; b < batchSize; b++)
+            {
+                if (!successFlags[b]) continue;
+                if (layer.QBias != null) AddVector(_qBatch + b * qDim, layer.QBias, qDim);
+                if (layer.KBias != null) AddVector(_kBatch + b * kvDim, layer.KBias, kvDim);
+                if (layer.VBias != null) AddVector(_vBatch + b * kvDim, layer.VBias, kvDim);
+
+                // RoPE per sequence position
+                QuantKernels.RoPE(_qBatch + b * qDim, _kBatch + b * kvDim, _nHeads, _nHeadsKv, _headDim, positions[b], _weights.RopeFreqBase);
+
+                // Store Key & Value into PagedBlockPool
+                pool.Store(pBlockIds[b], l, offsetsInBlock[b], _kBatch + b * kvDim, _vBatch + b * kvDim);
+
+                // Compute Attention for sequence b
+                float? sinkLogit = layer.AttnSinksWeight != null ? (float?)layer.AttnSinksWeight[0] : null;
+                PagedAttentionKernel.ComputeAttention(
+                    stageLayer: l,
+                    modelLayer: l,
+                    pos: positions[b],
+                    qBase: _qBatch + b * qDim,
+                    outBase: _attnOutBatch + b * outDim,
+                    blockTable: blockTables[b],
+                    pool: pool,
+                    nHeads: _nHeads,
+                    nHeadsKv: _nHeadsKv,
+                    headDim: _headDim,
+                    vHeadDim: _vHeadDim,
+                    attnScale: _attnScale,
+                    headScores: _headScores,
+                    maxSeqLen: _maxSeqLen,
+                    sinkLogit: sinkLogit);
+
+                QuantKernels.ComputeBlockSums32(_attnOutBatch + b * outDim, _attnOutSumsBatch + b * sumsDim, qDim);
+            }
+
+            // Unified Batch GEMM: Attention Out Projection
+            QuantKernels.MatMulBatch(layer.AttnOutType, layer.AttnOutWeight, _attnOutBatch, _attnProjBatch, qDim, _dim, batchSize, _attnOutSumsBatch);
+
+            for (int b = 0; b < batchSize; b++)
+            {
+                if (!successFlags[b]) continue;
+                AddVector(_xBatch + b * _dim, _attnProjBatch + b * _dim, _dim);
+
+                // FFN pre-norm
+                QuantKernels.RMSNorm(_xBatch + b * _dim, layer.FfnNormWeight, _normXBatch + b * _dim, _dim, _weights.RmsNormEps);
+                QuantKernels.ComputeBlockSums32(_normXBatch + b * _dim, _normXSumsBatch + b * sumsDim, _dim);
+            }
+
+            // Unified Batch GEMMs: FFN Gate & Up
+            QuantKernels.MatMulBatch(layer.FfnGateType, layer.FfnGateWeight, _normXBatch, _gateBatch, _dim, _ffnDim, batchSize, _normXSumsBatch);
+            QuantKernels.MatMulBatch(layer.FfnUpType, layer.FfnUpWeight, _normXBatch, _upBatch, _dim, _ffnDim, batchSize, _normXSumsBatch);
+
+            for (int b = 0; b < batchSize; b++)
+            {
+                if (!successFlags[b]) continue;
+                QuantKernels.SwiGLU(_gateBatch + b * _ffnDim, _upBatch + b * _ffnDim, _gateBatch + b * _ffnDim, _ffnDim);
+                QuantKernels.ComputeBlockSums32(_gateBatch + b * _ffnDim, _gateSumsBatch + b * gateSumsDim, _ffnDim);
+            }
+
+            // Unified Batch GEMM: FFN Down Projection
+            QuantKernels.MatMulBatch(layer.FfnDownType, layer.FfnDownWeight, _gateBatch, _ffnProjBatch, _ffnDim, _dim, batchSize, _gateSumsBatch);
+
+            for (int b = 0; b < batchSize; b++)
+            {
+                if (!successFlags[b]) continue;
+                AddVector(_xBatch + b * _dim, _ffnProjBatch + b * _dim, _dim);
+            }
+        }
+
+        // 4. Compute final logits if requested
+        if (computeLogits && !logitsBatch.IsEmpty)
+        {
+            for (int b = 0; b < batchSize; b++)
+            {
+                if (!successFlags[b]) continue;
+                QuantKernels.RMSNorm(_xBatch + b * _dim, _weights.OutNormWeight, _normXBatch + b * _dim, _dim, _weights.RmsNormEps);
+                QuantKernels.ComputeBlockSums32(_normXBatch + b * _dim, _normXSumsBatch + b * sumsDim, _dim);
+            }
+
+            fixed (float* pLogitsBatch = logitsBatch)
+            {
+                QuantKernels.MatMulBatch(_weights.OutType, _weights.OutWeight, _normXBatch, pLogitsBatch, _dim, _vocabSize, batchSize, _normXSumsBatch);
+            }
+        }
+
+        return true;
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void AddVector(float* a, float* b, int count)
     {
@@ -231,6 +434,20 @@ public sealed unsafe class PagedTransformerRunner : IDisposable
             if (_gateSums != null) NativeMemory.Free(_gateSums);
             if (_ffnProj != null) NativeMemory.Free(_ffnProj);
             if (_headScores != null) NativeMemory.Free(_headScores);
+
+            if (_xBatch != null) NativeMemory.Free(_xBatch);
+            if (_normXBatch != null) NativeMemory.Free(_normXBatch);
+            if (_normXSumsBatch != null) NativeMemory.Free(_normXSumsBatch);
+            if (_qBatch != null) NativeMemory.Free(_qBatch);
+            if (_kBatch != null) NativeMemory.Free(_kBatch);
+            if (_vBatch != null) NativeMemory.Free(_vBatch);
+            if (_attnOutBatch != null) NativeMemory.Free(_attnOutBatch);
+            if (_attnOutSumsBatch != null) NativeMemory.Free(_attnOutSumsBatch);
+            if (_attnProjBatch != null) NativeMemory.Free(_attnProjBatch);
+            if (_gateBatch != null) NativeMemory.Free(_gateBatch);
+            if (_upBatch != null) NativeMemory.Free(_upBatch);
+            if (_gateSumsBatch != null) NativeMemory.Free(_gateSumsBatch);
+            if (_ffnProjBatch != null) NativeMemory.Free(_ffnProjBatch);
         }
         GC.SuppressFinalize(this);
     }

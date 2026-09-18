@@ -5,6 +5,7 @@ using System.Text.Json;
 using System.Threading.Tasks;
 using Glacier.Serve.Core;
 using Glacier.Serve.Inference.Batching;
+using Glacier.Serve.Serialization;
 using Glacier.Serve.Server;
 
 namespace Glacier.Serve.Inference.Http;
@@ -32,28 +33,30 @@ public static class OllamaEndpoints
 
             await foreach (var token in tokenStream)
             {
-                string chunk = JsonSerializer.Serialize(new
+                var chunkDto = new OllamaChatChunk
                 {
-                    model = defaultModelName,
-                    message = new { role = "assistant", content = token },
-                    done = false
-                }) + "\n";
+                    Model = defaultModelName,
+                    Message = new ChatMessage { Role = "assistant", Content = token },
+                    Done = false
+                };
 
-                byte[] bytes = Encoding.UTF8.GetBytes(chunk);
+                byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(chunkDto, ServeJsonContext.Default.OllamaChatChunk);
                 await ctx.Response.BodyWriter.WriteAsync(bytes);
+                await ctx.Response.BodyWriter.WriteAsync("\n"u8.ToArray());
                 await ctx.Response.BodyWriter.FlushAsync();
             }
 
-            string finalChunk = JsonSerializer.Serialize(new
+            var finalChunkDto = new OllamaChatChunk
             {
-                model = defaultModelName,
-                done = true,
-                prompt_eval_count = state.PromptTokens.Length,
-                eval_count = state.GeneratedTokens.Count
-            }) + "\n";
+                Model = defaultModelName,
+                Done = true,
+                PromptEvalCount = state.PromptTokens.Length,
+                EvalCount = state.GeneratedTokens.Count
+            };
 
-            byte[] finalBytes = Encoding.UTF8.GetBytes(finalChunk);
+            byte[] finalBytes = JsonSerializer.SerializeToUtf8Bytes(finalChunkDto, ServeJsonContext.Default.OllamaChatChunk);
             await ctx.Response.BodyWriter.WriteAsync(finalBytes);
+            await ctx.Response.BodyWriter.WriteAsync("\n"u8.ToArray());
             await ctx.Response.BodyWriter.FlushAsync();
         });
 
@@ -76,48 +79,50 @@ public static class OllamaEndpoints
 
             await foreach (var token in tokenStream)
             {
-                string chunk = JsonSerializer.Serialize(new
+                var chunkDto = new OllamaGenerateChunk
                 {
-                    model = defaultModelName,
-                    response = token,
-                    done = false
-                }) + "\n";
+                    Model = defaultModelName,
+                    Response = token,
+                    Done = false
+                };
 
-                byte[] bytes = Encoding.UTF8.GetBytes(chunk);
+                byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(chunkDto, ServeJsonContext.Default.OllamaGenerateChunk);
                 await ctx.Response.BodyWriter.WriteAsync(bytes);
+                await ctx.Response.BodyWriter.WriteAsync("\n"u8.ToArray());
                 await ctx.Response.BodyWriter.FlushAsync();
             }
 
-            string finalChunk = JsonSerializer.Serialize(new
+            var finalChunkDto = new OllamaGenerateChunk
             {
-                model = defaultModelName,
-                done = true,
-                prompt_eval_count = state.PromptTokens.Length,
-                eval_count = state.GeneratedTokens.Count
-            }) + "\n";
+                Model = defaultModelName,
+                Done = true,
+                PromptEvalCount = state.PromptTokens.Length,
+                EvalCount = state.GeneratedTokens.Count
+            };
 
-            byte[] finalBytes = Encoding.UTF8.GetBytes(finalChunk);
+            byte[] finalBytes = JsonSerializer.SerializeToUtf8Bytes(finalChunkDto, ServeJsonContext.Default.OllamaGenerateChunk);
             await ctx.Response.BodyWriter.WriteAsync(finalBytes);
+            await ctx.Response.BodyWriter.WriteAsync("\n"u8.ToArray());
             await ctx.Response.BodyWriter.FlushAsync();
         });
 
         // GET /api/tags
         app.MapGet("/api/tags", async ctx =>
         {
-            var res = new
+            var res = new OllamaTagsResponse
             {
-                models = new[]
-                {
-                    new
+                Models =
+                [
+                    new OllamaModelItem
                     {
-                        name = defaultModelName,
-                        model = defaultModelName,
-                        modified_at = DateTimeOffset.UtcNow.ToString("o"),
-                        size = 4680000000L
+                        Name = defaultModelName,
+                        Model = defaultModelName,
+                        ModifiedAt = DateTimeOffset.UtcNow.ToString("o"),
+                        Size = 4680000000L
                     }
-                }
+                ]
             };
-            await ctx.Response.WriteJsonAsync(res);
+            await ctx.Response.WriteJsonAsync(res, ServeJsonContext.Default.OllamaTagsResponse);
         });
     }
 
@@ -126,10 +131,7 @@ public static class OllamaEndpoints
         if (request.Body.IsEmpty) return null;
         try
         {
-            return JsonSerializer.Deserialize<InferenceRequest>(request.Body.Span, new JsonSerializerOptions
-            {
-                PropertyNameCaseInsensitive = true
-            });
+            return JsonSerializer.Deserialize(request.Body.Span, ServeJsonContext.Default.InferenceRequest);
         }
         catch
         {

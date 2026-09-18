@@ -14,20 +14,20 @@ public static class MetricsEndpoint
     {
         app.MapGet("/health", async ctx =>
         {
-            var health = new
+            var health = new Glacier.Serve.Serialization.HealthCheckResponse
             {
-                status = "ok",
-                server = "Glacier.Serve",
-                engine = "ContinuousBatchEngine",
-                paged_attention = true,
-                active_batches = engine.ActiveBatchSize,
-                waiting_queue = engine.WaitingQueueLength,
-                free_kv_blocks = engine.BlockPool.FreeBlocksCount,
-                total_kv_blocks = engine.BlockPool.TotalBlocks,
-                tokens_generated = engine.TotalTokensGenerated,
-                throughput_tok_s = engine.ThroughputTokensPerSec
+                Status = "ok",
+                Server = "Glacier.Serve",
+                Engine = "ContinuousBatchEngine",
+                PagedAttention = true,
+                ActiveBatches = engine.ActiveBatchSize,
+                WaitingQueue = engine.WaitingQueueLength,
+                FreeKvBlocks = engine.BlockPool.FreeBlocksCount,
+                TotalKvBlocks = engine.BlockPool.TotalBlocks,
+                TokensGenerated = engine.TotalTokensGenerated,
+                ThroughputTokS = engine.ThroughputTokensPerSec
             };
-            await ctx.Response.WriteJsonAsync(health);
+            await ctx.Response.WriteJsonAsync(health, Glacier.Serve.Serialization.ServeJsonContext.Default.HealthCheckResponse);
         });
 
         app.MapGet("/metrics", async ctx =>

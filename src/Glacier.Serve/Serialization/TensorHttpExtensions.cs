@@ -37,15 +37,15 @@ public static class TensorHttpExtensions
         int[] shape = new int[tensor.Rank];
         for (int i = 0; i < tensor.Rank; i++) shape[i] = tensor.Shape[i];
 
-        var dto = new
+        var dto = new TensorDto
         {
-            rank = tensor.Rank,
-            shape = shape,
-            length = (int)tensor.ElementCount,
-            data = tensor.AsSpan().ToArray()
+            Rank = tensor.Rank,
+            Shape = shape,
+            Length = (int)tensor.ElementCount,
+            Data = tensor.AsSpan().ToArray()
         };
 
-        byte[] json = JsonSerializer.SerializeToUtf8Bytes(dto);
+        byte[] json = JsonSerializer.SerializeToUtf8Bytes(dto, ServeJsonContext.Default.TensorDto);
         await response.EnsureHeadersSentAsync(json.Length);
         await response.BodyWriter.WriteAsync(json);
         await response.BodyWriter.FlushAsync();

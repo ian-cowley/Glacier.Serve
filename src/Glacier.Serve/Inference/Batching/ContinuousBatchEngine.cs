@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
@@ -68,7 +69,7 @@ public sealed class ContinuousBatchEngine : IDisposable
         _maxBatchSize = maxBatchSize;
         _maxSeqLen = maxSeqLen;
 
-        _threadRunner = new ThreadLocal<PagedTransformerRunner>(() => new PagedTransformerRunner(_weights, _maxSeqLen), trackAllValues: true);
+        _threadRunner = new ThreadLocal<PagedTransformerRunner>(() => new PagedTransformerRunner(_weights, _maxSeqLen, _maxBatchSize), trackAllValues: true);
 
         _loopTask = Task.Run(RunIterationLoopAsync);
     }
@@ -113,6 +114,11 @@ public sealed class ContinuousBatchEngine : IDisposable
         var swStep = new Stopwatch();
         var logitsBuffer = new float[_weights.VocabSize];
 
+        int[] batchTokens = new int[_maxBatchSize];
+        int[] batchPositions = new int[_maxBatchSize];
+        bool[] successFlags = new bool[_maxBatchSize];
+        var blockTables = new BlockTable[_maxBatchSize];
+
         while (!_cts.IsCancellationRequested)
         {
             swStep.Restart();
@@ -130,39 +136,64 @@ public sealed class ContinuousBatchEngine : IDisposable
                 }
             }
 
-            // 2. Continuous Iteration Step across all active sequences
+            // 2. Continuous Iteration Step across all active sequences via Unified GEMM Batching
             if (_activeBatch.Count > 0)
             {
-                for (int i = 0; i < _activeBatch.Count; i++)
+                int count = _activeBatch.Count;
+
+                for (int i = 0; i < count; i++)
                 {
                     var seq = _activeBatch[i];
+                    batchTokens[i] = seq.LastToken;
+                    batchPositions[i] = seq.CurrentPos;
+                    blockTables[i] = seq.BlockTable;
+                }
+
+                int totalVocab = _weights.VocabSize;
+                float[] batchLogits = ArrayPool<float>.Shared.Rent(count * totalVocab);
+                try
+                {
                     var runner = _threadRunner.Value!;
+                    runner.ForwardBatch(
+                        batchTokens.AsSpan(0, count),
+                        batchPositions.AsSpan(0, count),
+                        blockTables,
+                        _pool,
+                        batchLogits.AsSpan(0, count * totalVocab),
+                        successFlags.AsSpan(0, count),
+                        computeLogits: true);
 
-                    // Forward single token step
-                    bool ok = runner.ForwardToken(seq.LastToken, seq.CurrentPos, seq.BlockTable, _pool, logitsBuffer.AsSpan(), computeLogits: true);
-                    if (!ok)
+                    for (int i = 0; i < count; i++)
                     {
-                        seq.IsFinished = true;
-                        seq.FinishReason = "pool_oom";
-                        continue;
+                        var seq = _activeBatch[i];
+                        if (!successFlags[i])
+                        {
+                            seq.IsFinished = true;
+                            seq.FinishReason = "pool_oom";
+                            continue;
+                        }
+
+                        var seqLogits = batchLogits.AsSpan(i * totalVocab, totalVocab);
+                        int nextToken = _sampler.Sample(seqLogits, seq.SamplingOptions);
+                        seq.LastToken = nextToken;
+                        seq.GeneratedTokens.Add(nextToken);
+                        seq.CurrentPos++;
+                        Interlocked.Increment(ref _totalTokensGenerated);
+
+                        string tokenText = _tokenizer.DecodeToken(nextToken);
+                        seq.TokenChannel.Writer.TryWrite(tokenText);
+
+                        // Check EOS or max tokens limit
+                        if (IsEosToken(nextToken) || seq.GeneratedTokens.Count >= seq.MaxNewTokens)
+                        {
+                            seq.IsFinished = true;
+                            seq.FinishReason = IsEosToken(nextToken) ? "stop" : "length";
+                        }
                     }
-
-                    // Sample next token
-                    int nextToken = _sampler.Sample(logitsBuffer.AsSpan(), seq.SamplingOptions);
-                    seq.LastToken = nextToken;
-                    seq.GeneratedTokens.Add(nextToken);
-                    seq.CurrentPos++;
-                    Interlocked.Increment(ref _totalTokensGenerated);
-
-                    string tokenText = _tokenizer.DecodeToken(nextToken);
-                    seq.TokenChannel.Writer.TryWrite(tokenText);
-
-                    // Check EOS or max tokens limit
-                    if (IsEosToken(nextToken) || seq.GeneratedTokens.Count >= seq.MaxNewTokens)
-                    {
-                        seq.IsFinished = true;
-                        seq.FinishReason = IsEosToken(nextToken) ? "stop" : "length";
-                    }
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(batchLogits);
                 }
 
                 // 3. Dynamic Eviction: clean up and recycle finished requests
