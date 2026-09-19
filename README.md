@@ -131,5 +131,12 @@ dotnet add package Glacier.Serve --version 1.1.0
 
 ---
 
+## Credits
+
+Developed by **Ian Cowley** and **Antigravity (Google DeepMind)**.
+
+---
+
 ## 📄 License
 MIT License. Part of the Glacier .NET 10 High-Performance AI Ecosystem.
+
