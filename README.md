@@ -122,5 +122,14 @@ dotnet add package Glacier.Serve --version 1.1.0
 
 ---
 
+## 🆕 What's New in v1.1.1
+
+- **Unified continuous batching GEMMs** — single kernel dispatch handles all batch types (prefill, decode, speculative), eliminating separate dispatch paths.
+- **Native AOT `ServeJsonContext`** — `System.Text.Json` source generation for all HTTP request/response types, enabling fully AOT-compatible JSON serialization.
+- **Zero-copy `ReadOnlySequence` pipeline for request body parsing** — request bodies are parsed directly from the `System.IO.Pipelines` buffer without intermediate copies.
+- **20 tests** passing (100 %).
+
+---
+
 ## 📄 License
 MIT License. Part of the Glacier .NET 10 High-Performance AI Ecosystem.
