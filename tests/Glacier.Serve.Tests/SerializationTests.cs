@@ -67,6 +67,25 @@ public class SerializationTests
     }
 
     [Fact]
+    public async Task DataFrame_SerializesToGlacierStorageArrowIpcAsync()
+    {
+        var s1 = new Int32Series("Value", 2);
+        new int[] { 100, 200 }.CopyTo(s1.Memory.Span);
+        var df = new DataFrame([s1]);
+
+        var pipe = new Pipe();
+        var response = new HttpResponse(pipe.Writer);
+
+        await response.WriteGlacierStorageArrowIpcAsync(df);
+
+        var readResult = await pipe.Reader.ReadAsync();
+        byte[] bytes = BuffersExtensions.ToArray(readResult.Buffer);
+
+        Assert.NotEmpty(bytes);
+        Assert.Equal("application/vnd.apache.arrow.stream", response.ContentType);
+    }
+
+    [Fact]
     public async Task Tensor_SerializesToBinaryAsync()
     {
         using var tensor = Tensor<float>.FromSpan([10f, 20f, 30f, 40f, 50f, 60f], [2, 3]);
