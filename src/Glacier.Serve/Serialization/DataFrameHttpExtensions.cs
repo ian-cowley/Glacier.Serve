@@ -3,31 +3,17 @@ namespace Glacier.Serve.Serialization;
 using System.IO;
 using System.Text.Json;
 using System.Threading.Tasks;
-using Apache.Arrow.Ipc;
 using Glacier.Polaris;
 using Glacier.Serve.Core;
 
 public static class DataFrameHttpExtensions
 {
     /// <summary>
-    /// Streams a Glacier.Polaris DataFrame as Apache Arrow IPC stream format directly to the HTTP response.
+    /// Streams a Glacier.Polaris DataFrame as Apache Arrow IPC stream format directly to the HTTP response
+    /// using Glacier.Storage managed streaming.
     /// </summary>
-    public static async ValueTask WriteArrowIpcAsync(this HttpResponse response, DataFrame df)
-    {
-        response.ContentType = "application/vnd.apache.arrow.stream";
-        var recordBatch = df.ToArrowRecordBatch();
-
-        using var ms = new MemoryStream();
-        using (var writer = new ArrowStreamWriter(ms, recordBatch.Schema))
-        {
-            await writer.WriteRecordBatchAsync(recordBatch);
-        }
-
-        byte[] bytes = ms.ToArray();
-        await response.EnsureHeadersSentAsync(bytes.Length);
-        await response.BodyWriter.WriteAsync(bytes);
-        await response.BodyWriter.FlushAsync();
-    }
+    public static ValueTask WriteArrowIpcAsync(this HttpResponse response, DataFrame df)
+        => WriteGlacierStorageArrowIpcAsync(response, df);
 
     /// <summary>
     /// Streams a Glacier.Polaris DataFrame using first-party Glacier.Storage pure managed ArrowStreamWriter.
