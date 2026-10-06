@@ -31,6 +31,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="Glacier.Serve.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Glacier.Storage" Version="1.0.1" />
     <PackageReference Include="Glacier.Polaris" Version="1.0.19" />
     <PackageReference Include="Glacier.Tensor" Version="1.0.9" />

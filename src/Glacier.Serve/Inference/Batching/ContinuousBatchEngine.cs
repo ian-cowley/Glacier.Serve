@@ -10,6 +10,7 @@ using Glacier.Inference.Gguf;
 using Glacier.Inference.Model;
 using Glacier.Inference.Sampling;
 using Glacier.Inference.Tokenizer;
+using Glacier.Serve.Diagnostics;
 using Glacier.Serve.Inference.PagedAttention;
 
 namespace Glacier.Serve.Inference.Batching;
@@ -299,7 +300,7 @@ public sealed class ContinuousBatchEngine : IDisposable
         {
             _disposed = true;
             _cts.Cancel();
-            try { _loopTask.Wait(500); } catch { }
+            try { _loopTask.Wait(500); } catch (Exception ex) { GlacierDiagnostics.LogDebug($"[Glacier.Serve] ContinuousBatchEngine loop task shutdown: {ex.Message}"); }
             _cts.Dispose();
 
             if (_threadRunner.Values != null)

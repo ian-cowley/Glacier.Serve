@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
 using Glacier.Serve.Core;
+using Glacier.Serve.Diagnostics;
 using Glacier.Serve.Inference.Batching;
 using Glacier.Serve.Serialization;
 using Glacier.Serve.Server;
@@ -133,8 +134,9 @@ public static class OllamaEndpoints
         {
             return JsonSerializer.Deserialize(request.Body.Span, ServeJsonContext.Default.InferenceRequest);
         }
-        catch
+        catch (Exception ex)
         {
+            GlacierDiagnostics.LogDebug($"[Glacier.Serve] Failed to deserialize Ollama request body: {ex.Message}");
             return null;
         }
     }

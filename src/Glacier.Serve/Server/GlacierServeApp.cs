@@ -9,6 +9,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Glacier.Serve.Core;
+using Glacier.Serve.Diagnostics;
 using Glacier.Serve.Parsing;
 using Glacier.Serve.Routing;
 
@@ -49,23 +50,71 @@ public sealed class GlacierServeApp : IDisposable
         return Task.CompletedTask;
     }
 
+    internal static int ComputeBackoffMs(int failureCount, int minBackoffMs = 10, int maxBackoffMs = 1000)
+    {
+        if (failureCount <= 0) return 0;
+        int shift = Math.Min(failureCount - 1, 20);
+        return Math.Min(minBackoffMs * (1 << shift), maxBackoffMs);
+    }
+
     private async Task AcceptLoopAsync(CancellationToken ct)
     {
+        int failureCount = 0;
+
         while (!ct.IsCancellationRequested)
         {
             try
             {
-                var socket = await _listener!.AcceptSocketAsync(ct).ConfigureAwait(false);
+                var listener = _listener;
+                if (listener == null) break;
+
+                var socket = await listener.AcceptSocketAsync(ct).ConfigureAwait(false);
+                failureCount = 0;
                 socket.NoDelay = true;
                 _ = Task.Run(() => ProcessConnectionAsync(socket, ct), ct);
             }
             catch (OperationCanceledException)
             {
+                GlacierDiagnostics.LogDebug("[Glacier.Serve] AcceptLoopAsync cancelled cleanly during shutdown.");
                 break;
             }
-            catch
+            catch (ObjectDisposedException odex)
             {
                 if (ct.IsCancellationRequested) break;
+                GlacierDiagnostics.LogWarning($"[Glacier.Serve] Listener disposed in AcceptLoopAsync: {odex.Message}");
+                break;
+            }
+            catch (SocketException sex)
+            {
+                if (ct.IsCancellationRequested) break;
+                failureCount++;
+                GlacierDiagnostics.LogError($"[Glacier.Serve] Socket error in AcceptLoopAsync (Code {sex.SocketErrorCode}): {sex.Message}", sex);
+
+                int backoffMs = ComputeBackoffMs(failureCount);
+                try
+                {
+                    await Task.Delay(backoffMs, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
+            catch (Exception ex)
+            {
+                if (ct.IsCancellationRequested) break;
+                failureCount++;
+                GlacierDiagnostics.LogError($"[Glacier.Serve] Unexpected listener error in AcceptLoopAsync: {ex.Message}", ex);
+
+                int backoffMs = ComputeBackoffMs(failureCount);
+                try
+                {
+                    await Task.Delay(backoffMs, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
             }
         }
     }
@@ -75,8 +124,6 @@ public sealed class GlacierServeApp : IDisposable
         using var stream = new NetworkStream(socket, ownsSocket: true);
         var reader = PipeReader.Create(stream);
         var writer = PipeWriter.Create(stream);
-
-        byte[] pathUtf8 = new byte[1024];
 
         try
         {
@@ -192,13 +239,7 @@ public sealed class GlacierServeApp : IDisposable
                 var response = new HttpResponse(writer);
                 var context = new HttpContext(request, response, ct);
 
-                int pathMaxBytes = Encoding.UTF8.GetMaxByteCount(request.Path.Length);
-                if (pathMaxBytes > pathUtf8.Length)
-                {
-                    pathUtf8 = new byte[pathMaxBytes];
-                }
-                int pathBytesWritten = Encoding.UTF8.GetBytes(request.Path, pathUtf8);
-                if (_router.TryMatch(method, pathUtf8.AsSpan(0, pathBytesWritten), out var match))
+                if (TryMatchRoute(_router, method, request.Path, out var match))
                 {
                     if (match.Parameters != null)
                     {
@@ -224,14 +265,40 @@ public sealed class GlacierServeApp : IDisposable
                 }
             }
         }
+        catch (OperationCanceledException)
+        {
+            GlacierDiagnostics.LogDebug("[Glacier.Serve] Connection processing cancelled.");
+        }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[ProcessConnectionAsync ERROR]: {ex}");
+            GlacierDiagnostics.LogError($"[Glacier.Serve] ProcessConnectionAsync error: {ex.Message}", ex);
         }
         finally
         {
             await reader.CompleteAsync().ConfigureAwait(false);
             await writer.CompleteAsync().ConfigureAwait(false);
+        }
+    }
+
+    internal static bool TryMatchRoute(IRouter router, HttpMethod method, string path, out RouteMatch match)
+    {
+        int pathMaxBytes = Encoding.UTF8.GetMaxByteCount(path.Length);
+        if (pathMaxBytes <= 512)
+        {
+            Span<byte> pathSpan = stackalloc byte[512];
+            int pathBytesWritten = Encoding.UTF8.GetBytes(path, pathSpan);
+            return router.TryMatch(method, pathSpan[..pathBytesWritten], out match);
+        }
+
+        byte[] rented = ArrayPool<byte>.Shared.Rent(pathMaxBytes);
+        try
+        {
+            int pathBytesWritten = Encoding.UTF8.GetBytes(path, rented);
+            return router.TryMatch(method, rented.AsSpan(0, pathBytesWritten), out match);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
         }
     }
 
