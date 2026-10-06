@@ -122,6 +122,15 @@ dotnet add package Glacier.Serve --version 1.1.0
 
 ---
 
+## 🆕 What's New in v1.1.2
+
+- **Zero-Allocation Ingress Buffer Management** — Replaced per-connection heap buffer allocations in `GlacierServeApp.ProcessConnectionAsync` with `stackalloc byte[512]` and an `ArrayPool<byte>.Shared` fallback protected by `try/finally`, eliminating GC churn during concurrent connection bursts.
+- **Resilient Listener Error Diagnostics** — Structured socket and listener error handling with exponential backoff (10ms..1000ms), eliminating silent exception swallowing in `AcceptLoopAsync`.
+- **Pluggable Ambient Logging** — Integrated zero-dependency `GlacierDiagnostics` / `IGlacierLogger`.
+- **36 unit tests** passing (100% green).
+
+---
+
 ## 🆕 What's New in v1.1.1
 
 - **Unified continuous batching GEMMs** — single kernel dispatch handles all batch types (prefill, decode, speculative), eliminating separate dispatch paths.
