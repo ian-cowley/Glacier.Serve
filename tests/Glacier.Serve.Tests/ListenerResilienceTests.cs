@@ -44,10 +44,10 @@ public class ListenerResilienceTests
     [Fact]
     public async Task Server_StartsAndStopsCleanly_MultipleCycles()
     {
-        var logMessages = new List<(LogLevel Level, string Message)>();
+        var logMessages = new System.Collections.Concurrent.ConcurrentQueue<(LogLevel Level, string Message)>();
         var testLogger = new DelegateGlacierLogger((level, msg, _) =>
         {
-            logMessages.Add((level, msg));
+            logMessages.Enqueue((level, msg));
         }, LogLevel.Debug);
 
         GlacierDiagnostics.SetLogger(testLogger);
@@ -81,8 +81,18 @@ public class ListenerResilienceTests
                 Assert.False(app.IsRunning);
             }
 
-            // Verify clean cancellation logging occurred
-            Assert.Contains(logMessages, m => m.Message.Contains("AcceptLoopAsync cancelled cleanly"));
+            // Verify clean cancellation logging occurred (allow brief moment for async accept loop to finish logging)
+            bool found = false;
+            for (int i = 0; i < 20; i++)
+            {
+                if (System.Linq.Enumerable.Any(logMessages.ToArray(), m => m.Message.Contains("AcceptLoopAsync cancelled cleanly")))
+                {
+                    found = true;
+                    break;
+                }
+                await Task.Delay(25);
+            }
+            Assert.True(found, "Expected 'AcceptLoopAsync cancelled cleanly' in logs.");
         }
         finally
         {
@@ -93,8 +103,8 @@ public class ListenerResilienceTests
     [Fact]
     public async Task Server_HandlesMalformedTcpConnections_Resiliently()
     {
-        var logMessages = new List<string>();
-        var testLogger = new DelegateGlacierLogger(msg => logMessages.Add(msg), LogLevel.Debug);
+        var logMessages = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        var testLogger = new DelegateGlacierLogger(msg => logMessages.Enqueue(msg), LogLevel.Debug);
         GlacierDiagnostics.SetLogger(testLogger);
 
         try
