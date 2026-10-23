@@ -42,6 +42,8 @@ public sealed unsafe class PagedTransformerRunner : IDisposable
     private readonly float* _gateSums;
     private readonly float* _ffnProj;
     private readonly float* _headScores;
+    private readonly float* _yarnInvFreq;
+    private readonly float _yarnMscale;
 
     // Batched activation scratch buffers for unified GEMM execution
     private readonly float* _xBatch;
@@ -74,7 +76,31 @@ public sealed unsafe class PagedTransformerRunner : IDisposable
         _nHeadsKv = _weights.HeadCountKv;
         _headDim = _weights.HeadDim;
         _vHeadDim = _weights.ValueDim > 0 ? _weights.ValueDim : _headDim;
-        _attnScale = 1.0f / MathF.Sqrt(_headDim);
+        int qkRopeDim = _weights.RopeDimensionCount;
+        int halfRope = qkRopeDim / 2;
+        if (_weights.Gguf.RopeScalingType.Equals("yarn", StringComparison.OrdinalIgnoreCase))
+        {
+            _yarnInvFreq = (float*)NativeMemory.AllocZeroed((nuint)(halfRope * sizeof(float)));
+            QuantKernels.PrecomputeYarnFrequencies(
+                new Span<float>(_yarnInvFreq, halfRope),
+                qkRopeDim,
+                _weights.RopeFreqBase,
+                _weights.Gguf.RopeScalingFactor > 0 ? _weights.Gguf.RopeScalingFactor : 1.0f,
+                _weights.Gguf.RopeScalingOriginalContextLength > 0 ? _weights.Gguf.RopeScalingOriginalContextLength : 4096);
+
+            float logMul = _weights.Gguf.RopeScalingYarnLogMultiplier > 0 ? _weights.Gguf.RopeScalingYarnLogMultiplier : 0.0707f;
+            float factor = _weights.Gguf.RopeScalingFactor > 0 ? _weights.Gguf.RopeScalingFactor : 1.0f;
+            _yarnMscale = QuantKernels.ComputeYarnMscale(factor, mscale: 1.0f, mscaleAllDim: logMul / 0.1f);
+            // QuantKernels.RoPE scales both Q and K by _yarnMscale, resulting in (mscale)^2 in Q*K;
+            // scaling _attnScale by _yarnMscale again would scale attention logits by (mscale)^3, over-concentrating softmax weights.
+            _attnScale = 1.0f / MathF.Sqrt(_headDim);
+        }
+        else
+        {
+            _yarnInvFreq = null;
+            _yarnMscale = 1.0f;
+            _attnScale = 1.0f / MathF.Sqrt(_headDim);
+        }
         _layerCount = _weights.BlockCount;
         _vocabSize = _weights.VocabSize;
         _maxSeqLen = maxSeqLen;
@@ -174,7 +200,7 @@ public sealed unsafe class PagedTransformerRunner : IDisposable
             if (layer.VBias != null) AddVector(_v, layer.VBias, kvDim);
 
             // Rotary Position Embedding
-            QuantKernels.RoPE(_q, _k, _nHeads, _nHeadsKv, _headDim, pos, _weights.RopeFreqBase);
+            QuantKernels.RoPE(_q, _k, _nHeads, _nHeadsKv, _headDim, pos, _weights.RopeFreqBase, invFreqTable: _yarnInvFreq, mscale: _yarnMscale);
 
             // Store Key and Value into PagedBlockPool
             pool.Store(pBlockId, l, offsetInBlock, _k, _v);
@@ -315,7 +341,7 @@ public sealed unsafe class PagedTransformerRunner : IDisposable
                 if (layer.VBias != null) AddVector(_vBatch + b * kvDim, layer.VBias, kvDim);
 
                 // RoPE per sequence position
-                QuantKernels.RoPE(_qBatch + b * qDim, _kBatch + b * kvDim, _nHeads, _nHeadsKv, _headDim, positions[b], _weights.RopeFreqBase);
+                QuantKernels.RoPE(_qBatch + b * qDim, _kBatch + b * kvDim, _nHeads, _nHeadsKv, _headDim, positions[b], _weights.RopeFreqBase, invFreqTable: _yarnInvFreq, mscale: _yarnMscale);
 
                 // Store Key & Value into PagedBlockPool
                 pool.Store(pBlockIds[b], l, offsetsInBlock[b], _kBatch + b * kvDim, _vBatch + b * kvDim);
@@ -434,6 +460,7 @@ public sealed unsafe class PagedTransformerRunner : IDisposable
             if (_gateSums != null) NativeMemory.Free(_gateSums);
             if (_ffnProj != null) NativeMemory.Free(_ffnProj);
             if (_headScores != null) NativeMemory.Free(_headScores);
+            if (_yarnInvFreq != null) NativeMemory.Free(_yarnInvFreq);
 
             if (_xBatch != null) NativeMemory.Free(_xBatch);
             if (_normXBatch != null) NativeMemory.Free(_normXBatch);

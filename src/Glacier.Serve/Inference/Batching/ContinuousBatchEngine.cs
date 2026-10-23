@@ -273,23 +273,22 @@ public sealed class ContinuousBatchEngine : IDisposable
         return true;
     }
 
-    private static bool IsEosToken(int token)
+    private bool IsEosToken(int token)
     {
-        // Standard Qwen2 / Llama EOS tokens: 151643 (<|endoftext|>), 151645 (<|im_end|>), 2 (<eos>)
-        return token == 151643 || token == 151645 || token == 2 || token == 1;
+        // Check tokenizer's dynamically registered stop tokens (DeepSeek, Qwen2, Llama, Gemma)
+        return _tokenizer.IsStopToken(token) || token == 151643 || token == 151645 || token == 2 || token == 1;
     }
 
-    private static string FormatPrompt(InferenceRequest req)
+    private string FormatPrompt(InferenceRequest req)
     {
         if (req.Messages != null && req.Messages.Count > 0)
         {
-            var sb = new System.Text.StringBuilder();
+            var list = new List<(string Role, string Content)>(req.Messages.Count);
             foreach (var m in req.Messages)
             {
-                sb.Append($"<|im_start|>{m.Role}\n{m.Content}<|im_end|>\n");
+                list.Add((m.Role, m.Content));
             }
-            sb.Append("<|im_start|>assistant\n");
-            return sb.ToString();
+            return _tokenizer.FormatConversation(list);
         }
         return req.Prompt ?? string.Empty;
     }

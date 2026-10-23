@@ -38,7 +38,7 @@
     <PackageReference Include="Glacier.Storage" Version="1.0.1" />
     <PackageReference Include="Glacier.Polaris" Version="1.0.20" />
     <PackageReference Include="Glacier.Tensor" Version="1.0.9" />
-    <PackageReference Include="Glacier.Inference" Version="1.2.19" />
-    <PackageReference Include="Glacier.Gpu" Version="1.0.8" />
+    <ProjectReference Include="..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj" />
+    <PackageReference Include="Glacier.Gpu" Version="1.0.9" />
   </ItemGroup>
 </Project>
