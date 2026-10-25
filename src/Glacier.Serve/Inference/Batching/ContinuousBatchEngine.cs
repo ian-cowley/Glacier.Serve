@@ -3,6 +3,7 @@ using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
@@ -94,6 +95,23 @@ public sealed class ContinuousBatchEngine : IDisposable
             topP: request.TopP,
             stopSequences: request.Stop);
 
+        if (_tokenizer.TryGetTokenId("<think>", out int thinkId))
+            state.SamplingOptions.ThinkTokenId = thinkId;
+        if (_tokenizer.TryGetTokenId("</think>", out int endThinkId))
+            state.SamplingOptions.EndThinkTokenId = endThinkId;
+        if (request.MaxReasoningTokens > 0)
+            state.SamplingOptions.MaxReasoningTokens = request.MaxReasoningTokens;
+
+        if (state.SamplingOptions.ThinkTokenId >= 0)
+        {
+            int lastThink = Array.LastIndexOf(promptTokens, state.SamplingOptions.ThinkTokenId);
+            int lastEndThink = state.SamplingOptions.EndThinkTokenId >= 0 ? Array.LastIndexOf(promptTokens, state.SamplingOptions.EndThinkTokenId) : -1;
+            if (lastThink >= 0 && lastThink > lastEndThink)
+            {
+                state.IsInReasoningBlock = true;
+            }
+        }
+
         Interlocked.Increment(ref _waitingCount);
         await _waitingQueue.Writer.WriteAsync(state, ct);
         return (state, ReadTokensAsync(state, ct));
@@ -175,11 +193,41 @@ public sealed class ContinuousBatchEngine : IDisposable
                         }
 
                         var seqLogits = batchLogits.AsSpan(i * totalVocab, totalVocab);
-                        int nextToken = _sampler.Sample(seqLogits, seq.SamplingOptions);
+
+                        // Dynamic reasoning token budgeting & logit clamping
+                        if (seq.IsInReasoningBlock &&
+                            seq.SamplingOptions.MaxReasoningTokens > 0 &&
+                            seq.CurrentReasoningTokens >= seq.SamplingOptions.MaxReasoningTokens &&
+                            seq.SamplingOptions.EndThinkTokenId >= 0)
+                        {
+                            Sampler.ClampReasoningLogits(seqLogits, seq.SamplingOptions.EndThinkTokenId);
+                        }
+
+                        ReadOnlySpan<int> recentTokens = CollectionsMarshal.AsSpan(seq.GeneratedTokens);
+                        if (seq.SamplingOptions.EnableReasoningLoopGuard && !recentTokens.IsEmpty && Sampler.DetectPeriodicReasoningLoop(recentTokens) > 0)
+                        {
+                            seq.LoopRecoveryTriggers++;
+                        }
+
+                        int nextToken = _sampler.Sample(seqLogits, seq.SamplingOptions, recentTokens);
                         seq.LastToken = nextToken;
                         seq.GeneratedTokens.Add(nextToken);
                         seq.CurrentPos++;
                         Interlocked.Increment(ref _totalTokensGenerated);
+
+                        // Update reasoning state
+                        if (seq.SamplingOptions.ThinkTokenId >= 0 && nextToken == seq.SamplingOptions.ThinkTokenId)
+                        {
+                            seq.IsInReasoningBlock = true;
+                        }
+                        else if (seq.SamplingOptions.EndThinkTokenId >= 0 && nextToken == seq.SamplingOptions.EndThinkTokenId)
+                        {
+                            seq.IsInReasoningBlock = false;
+                        }
+                        else if (seq.IsInReasoningBlock)
+                        {
+                            seq.CurrentReasoningTokens++;
+                        }
 
                         string tokenText = _tokenizer.DecodeToken(nextToken);
                         seq.TokenChannel.Writer.TryWrite(tokenText);
@@ -248,12 +296,34 @@ public sealed class ContinuousBatchEngine : IDisposable
         }
 
         // Sample first token from prompt completion
+        if (seq.IsInReasoningBlock &&
+            seq.SamplingOptions.MaxReasoningTokens > 0 &&
+            seq.CurrentReasoningTokens >= seq.SamplingOptions.MaxReasoningTokens &&
+            seq.SamplingOptions.EndThinkTokenId >= 0)
+        {
+            Sampler.ClampReasoningLogits(logitsBuffer.AsSpan(), seq.SamplingOptions.EndThinkTokenId);
+        }
+
         int firstToken = _sampler.Sample(logitsBuffer.AsSpan(), seq.SamplingOptions);
         seq.LastToken = firstToken;
         seq.GeneratedTokens.Add(firstToken);
         seq.CurrentPos = promptLen;
         seq.FirstTokenTime = DateTimeOffset.UtcNow;
         Interlocked.Increment(ref _totalTokensGenerated);
+
+        // Update reasoning state
+        if (seq.SamplingOptions.ThinkTokenId >= 0 && firstToken == seq.SamplingOptions.ThinkTokenId)
+        {
+            seq.IsInReasoningBlock = true;
+        }
+        else if (seq.SamplingOptions.EndThinkTokenId >= 0 && firstToken == seq.SamplingOptions.EndThinkTokenId)
+        {
+            seq.IsInReasoningBlock = false;
+        }
+        else if (seq.IsInReasoningBlock)
+        {
+            seq.CurrentReasoningTokens++;
+        }
 
         string text = _tokenizer.DecodeToken(firstToken);
         seq.TokenChannel.Writer.TryWrite(text);

@@ -22,6 +22,9 @@ public sealed class SequenceState
     public int MaxNewTokens { get; set; }
     public SamplingOptions SamplingOptions { get; }
     public string[]? StopSequences { get; set; }
+    public int CurrentReasoningTokens { get; set; }
+    public bool IsInReasoningBlock { get; set; }
+    public int LoopRecoveryTriggers { get; set; }
 
     public Channel<string> TokenChannel { get; } = Channel.CreateUnbounded<string>(new UnboundedChannelOptions
     {

@@ -8,8 +8,14 @@ using Glacier.Serve.Inference.PagedAttention;
 
 public static class Program
 {
-    public static void Main(string[] args)
+    public static async Task Main(string[] args)
     {
+        if (args.Length > 0 && (args[0].Equals("--rec1", StringComparison.OrdinalIgnoreCase) || args[0].Equals("--rec1-benchmark", StringComparison.OrdinalIgnoreCase)))
+        {
+            await Rec1Benchmark.RunAsync(args);
+            return;
+        }
+
         if (args.Length > 0 && args[0].Equals("--bdn", StringComparison.OrdinalIgnoreCase))
         {
             BenchmarkRunner.Run<ParserBenchmarks>();

@@ -21,4 +21,5 @@ public sealed class InferenceRequest
     public float TopP { get; set; } = 0.9f;
     public bool Stream { get; set; } = false;
     public string[]? Stop { get; set; }
+    public int MaxReasoningTokens { get; set; } = 0;
 }
