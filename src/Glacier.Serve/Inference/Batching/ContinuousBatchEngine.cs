@@ -30,6 +30,7 @@ public sealed class ContinuousBatchEngine : IDisposable
     private readonly Sampler _sampler;
     private readonly int _maxBatchSize;
     private readonly int _maxSeqLen;
+    private readonly int _defaultReasoningLoopMinPeriod;
 
     private readonly Channel<SequenceState> _waitingQueue = Channel.CreateUnbounded<SequenceState>(new UnboundedChannelOptions
     {
@@ -61,15 +62,16 @@ public sealed class ContinuousBatchEngine : IDisposable
     public double LastIterationMs => _lastIterationMs;
     public double ThroughputTokensPerSec => TotalTokensGenerated / Math.Max(0.001, _uptime.Elapsed.TotalSeconds);
 
-    public ContinuousBatchEngine(string modelPath, int totalKvBlocks = 1024, int maxBatchSize = 32, int maxSeqLen = 4096)
+    public ContinuousBatchEngine(string modelPath, int totalKvBlocks = 1024, int maxBatchSize = 32, int maxSeqLen = 4096, int? seed = null, int defaultReasoningLoopMinPeriod = 1)
     {
         _gguf = GgufFile.Open(modelPath);
         _weights = new ModelWeights(_gguf);
         _tokenizer = new BpeTokenizer(_gguf);
         _pool = new PagedBlockPool(totalKvBlocks, _weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, blockSize: 16, vHeadDim: _weights.ValueDim);
-        _sampler = new Sampler();
+        _sampler = new Sampler(seed);
         _maxBatchSize = maxBatchSize;
         _maxSeqLen = maxSeqLen;
+        _defaultReasoningLoopMinPeriod = defaultReasoningLoopMinPeriod;
 
         _threadRunner = new ThreadLocal<PagedTransformerRunner>(() => new PagedTransformerRunner(_weights, _maxSeqLen, _maxBatchSize), trackAllValues: true);
 
@@ -101,6 +103,12 @@ public sealed class ContinuousBatchEngine : IDisposable
             state.SamplingOptions.EndThinkTokenId = endThinkId;
         if (request.MaxReasoningTokens > 0)
             state.SamplingOptions.MaxReasoningTokens = request.MaxReasoningTokens;
+        if (request.EnableReasoningLoopGuard.HasValue)
+            state.SamplingOptions.EnableReasoningLoopGuard = request.EnableReasoningLoopGuard.Value;
+        if (request.ReasoningLoopMinPeriod.HasValue)
+            state.SamplingOptions.ReasoningLoopMinPeriod = request.ReasoningLoopMinPeriod.Value;
+        else if (_defaultReasoningLoopMinPeriod != 1)
+            state.SamplingOptions.ReasoningLoopMinPeriod = _defaultReasoningLoopMinPeriod;
 
         if (state.SamplingOptions.ThinkTokenId >= 0)
         {
@@ -195,21 +203,30 @@ public sealed class ContinuousBatchEngine : IDisposable
                         var seqLogits = batchLogits.AsSpan(i * totalVocab, totalVocab);
 
                         // Dynamic reasoning token budgeting & logit clamping
-                        if (seq.IsInReasoningBlock &&
+                        if (seq.SamplingOptions.EnableReasoningLoopGuard &&
+                            seq.IsInReasoningBlock &&
                             seq.SamplingOptions.MaxReasoningTokens > 0 &&
                             seq.CurrentReasoningTokens >= seq.SamplingOptions.MaxReasoningTokens &&
                             seq.SamplingOptions.EndThinkTokenId >= 0)
                         {
+                            seq.BudgetClampTriggers++;
+                            seq.LoopRecoveryTriggers++;
                             Sampler.ClampReasoningLogits(seqLogits, seq.SamplingOptions.EndThinkTokenId);
                         }
 
+                        bool isReasoningActive = seq.SamplingOptions.ThinkTokenId < 0 || seq.IsInReasoningBlock;
                         ReadOnlySpan<int> recentTokens = CollectionsMarshal.AsSpan(seq.GeneratedTokens);
-                        if (seq.SamplingOptions.EnableReasoningLoopGuard && !recentTokens.IsEmpty && Sampler.DetectPeriodicReasoningLoop(recentTokens) > 0)
+                        int minPeriod = seq.SamplingOptions.ReasoningLoopMinPeriod;
+                        if (seq.SamplingOptions.EnableReasoningLoopGuard && isReasoningActive && !recentTokens.IsEmpty && Sampler.DetectPeriodicReasoningLoop(recentTokens, minPeriod: minPeriod) > 0)
                         {
+                            seq.PeriodicLoopTriggers++;
                             seq.LoopRecoveryTriggers++;
                         }
 
+                        bool origEnableLoopGuard = seq.SamplingOptions.EnableReasoningLoopGuard;
+                        seq.SamplingOptions.EnableReasoningLoopGuard = origEnableLoopGuard && isReasoningActive;
                         int nextToken = _sampler.Sample(seqLogits, seq.SamplingOptions, recentTokens);
+                        seq.SamplingOptions.EnableReasoningLoopGuard = origEnableLoopGuard;
                         seq.LastToken = nextToken;
                         seq.GeneratedTokens.Add(nextToken);
                         seq.CurrentPos++;
@@ -358,7 +375,8 @@ public sealed class ContinuousBatchEngine : IDisposable
             {
                 list.Add((m.Role, m.Content));
             }
-            return _tokenizer.FormatConversation(list);
+            bool thinking = req.MaxReasoningTokens > 0;
+            return _tokenizer.FormatConversation(list, thinkingMode: thinking);
         }
         return req.Prompt ?? string.Empty;
     }

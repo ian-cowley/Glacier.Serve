@@ -22,4 +22,6 @@ public sealed class InferenceRequest
     public bool Stream { get; set; } = false;
     public string[]? Stop { get; set; }
     public int MaxReasoningTokens { get; set; } = 0;
+    public bool? EnableReasoningLoopGuard { get; set; }
+    public int? ReasoningLoopMinPeriod { get; set; }
 }
