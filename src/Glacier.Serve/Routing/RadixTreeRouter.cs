@@ -2,116 +2,345 @@ namespace Glacier.Serve.Routing;
 
 using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using System.Text;
 
+/// <summary>
+/// True compressed UTF-8 prefix &amp; parametric segment Radix Tree router.
+/// Matches incoming HTTP paths directly over <see cref="ReadOnlySpan{T}"/> of <see cref="byte"/>
+/// with zero intermediate string or segment-array heap allocations on static routes,
+/// stripping query strings (<c>?...</c>) in place and decoding UTF-8 parameter slices only on match.
+/// Supports both <c>{param}</c> and <c>:param</c> route parameter syntax.
+/// </summary>
 public sealed class RadixTreeRouter : IRouter
 {
-    private class RouteEntry
+    private const int MethodCount = 8;
+
+    private sealed class HandlerEntry
     {
-        public required HttpMethod Method { get; init; }
-        public required string Template { get; init; }
-        public required string[] Segments { get; init; }
-        public required bool[] IsParam { get; init; }
-        public required string[] ParamNames { get; init; }
         public required RequestDelegate Handler { get; init; }
+        public required string[] ParamNames { get; init; }
     }
 
-    private readonly List<RouteEntry> _routes = new();
-    private readonly Dictionary<(HttpMethod, string), RequestDelegate> _exactRoutes = new();
+    private sealed class RadixNode
+    {
+        public byte[] Prefix;
+        public RadixNode[] StaticChildren = [];
+        public RadixNode? ParametricChild;
+        public readonly HandlerEntry?[] Handlers = new HandlerEntry?[MethodCount];
+
+        public RadixNode(byte[] prefix)
+        {
+            Prefix = prefix;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public RadixNode? FindStaticChildByFirstByte(byte firstByte)
+        {
+            var children = StaticChildren;
+            for (int i = 0; i < children.Length; i++)
+            {
+                if (children[i].Prefix[0] == firstByte)
+                    return children[i];
+            }
+            return null;
+        }
+
+        public void AddOrReplaceStaticChild(RadixNode child)
+        {
+            byte first = child.Prefix[0];
+            for (int i = 0; i < StaticChildren.Length; i++)
+            {
+                if (StaticChildren[i].Prefix[0] == first)
+                {
+                    StaticChildren[i] = child;
+                    return;
+                }
+            }
+
+            var expanded = new RadixNode[StaticChildren.Length + 1];
+            Array.Copy(StaticChildren, expanded, StaticChildren.Length);
+            expanded[^1] = child;
+            StaticChildren = expanded;
+        }
+    }
+
+    private readonly RadixNode _root = new([]);
+    private int _maxParams;
 
     public void AddRoute(HttpMethod method, string routeTemplate, RequestDelegate handler)
     {
-        if (string.IsNullOrEmpty(routeTemplate)) routeTemplate = "/";
-        if (!routeTemplate.StartsWith('/')) routeTemplate = "/" + routeTemplate;
+        ArgumentNullException.ThrowIfNull(handler);
 
-        // Strip trailing slash if not root
-        if (routeTemplate.Length > 1 && routeTemplate.EndsWith('/'))
+        if (string.IsNullOrEmpty(routeTemplate))
+            routeTemplate = "/";
+
+        // Strip any accidental query string on template registration
+        int qIdx = routeTemplate.IndexOf('?');
+        if (qIdx >= 0)
+            routeTemplate = routeTemplate[..qIdx];
+
+        if (!routeTemplate.StartsWith('/'))
+            routeTemplate = "/" + routeTemplate;
+
+        while (routeTemplate.Length > 1 && routeTemplate.EndsWith('/'))
             routeTemplate = routeTemplate[..^1];
 
-        // If route has no parameters, register in exact route fast map
-        if (!routeTemplate.Contains('{'))
-        {
-            _exactRoutes[(method, routeTemplate)] = handler;
-        }
+        var paramNames = new List<string>(4);
+        RadixNode current = _root;
 
-        var rawSegments = routeTemplate.Split('/', StringSplitOptions.RemoveEmptyEntries);
-        var isParam = new bool[rawSegments.Length];
-        var paramNames = new string[rawSegments.Length];
+        int cursor = 0;
+        int staticStart = 0;
 
-        for (int i = 0; i < rawSegments.Length; i++)
+        while (cursor < routeTemplate.Length)
         {
-            var s = rawSegments[i];
-            if (s.StartsWith('{') && s.EndsWith('}'))
+            // Detect parameter start right after '/' as either '{name}' or ':name'
+            if (cursor > 0 && routeTemplate[cursor - 1] == '/' &&
+                (routeTemplate[cursor] == '{' || routeTemplate[cursor] == ':'))
             {
-                isParam[i] = true;
-                paramNames[i] = s[1..^1];
-            }
-            else
-            {
-                isParam[i] = false;
-                paramNames[i] = string.Empty;
-            }
-        }
-
-        _routes.Add(new RouteEntry
-        {
-            Method = method,
-            Template = routeTemplate,
-            Segments = rawSegments,
-            IsParam = isParam,
-            ParamNames = paramNames,
-            Handler = handler
-        });
-    }
-
-    public bool TryMatch(HttpMethod method, ReadOnlySpan<byte> path, out RouteMatch match)
-    {
-        match = default;
-        if (path.IsEmpty) return false;
-
-        // Fast path: Exact route match
-        string pathStr = Encoding.UTF8.GetString(path);
-        if (pathStr.Length > 1 && pathStr.EndsWith('/')) pathStr = pathStr[..^1];
-
-        if (_exactRoutes.TryGetValue((method, pathStr), out var fastHandler))
-        {
-            match = new RouteMatch(fastHandler, []);
-            return true;
-        }
-
-        var pathSegments = pathStr.Split('/', StringSplitOptions.RemoveEmptyEntries);
-
-        foreach (var r in _routes)
-        {
-            if (r.Method != method) continue;
-            if (r.Segments.Length != pathSegments.Length) continue;
-
-            bool isMatch = true;
-            var paramList = new List<RouteParameter>();
-
-            for (int i = 0; i < r.Segments.Length; i++)
-            {
-                if (r.IsParam[i])
+                // Flush preceding static bytes (including the '/' right before the parameter)
+                if (cursor > staticStart)
                 {
-                    paramList.Add(new RouteParameter(r.ParamNames[i], pathSegments[i]));
+                    byte[] staticBytes = Encoding.UTF8.GetBytes(routeTemplate.AsSpan(staticStart, cursor - staticStart).ToString());
+                    current = InsertStaticPrefix(current, staticBytes);
+                }
+
+                string paramName;
+                if (routeTemplate[cursor] == '{')
+                {
+                    int closeBrace = routeTemplate.IndexOf('}', cursor + 1);
+                    if (closeBrace < 0)
+                        throw new ArgumentException($"Unclosed route parameter brace in template '{routeTemplate}'.", nameof(routeTemplate));
+
+                    paramName = routeTemplate[(cursor + 1)..closeBrace];
+                    cursor = closeBrace + 1;
                 }
                 else
                 {
-                    if (!string.Equals(r.Segments[i], pathSegments[i], StringComparison.Ordinal))
-                    {
-                        isMatch = false;
-                        break;
-                    }
+                    int nextSlash = routeTemplate.IndexOf('/', cursor + 1);
+                    int end = nextSlash >= 0 ? nextSlash : routeTemplate.Length;
+                    paramName = routeTemplate[(cursor + 1)..end];
+                    cursor = end;
                 }
+
+                if (string.IsNullOrEmpty(paramName))
+                    throw new ArgumentException($"Empty route parameter name in template '{routeTemplate}'.", nameof(routeTemplate));
+
+                paramNames.Add(paramName);
+                current.ParametricChild ??= new RadixNode([]);
+                current = current.ParametricChild;
+                staticStart = cursor;
+                continue;
             }
 
-            if (isMatch)
+            cursor++;
+        }
+
+        if (cursor > staticStart)
+        {
+            byte[] trailingStatic = Encoding.UTF8.GetBytes(routeTemplate[staticStart..cursor]);
+            current = InsertStaticPrefix(current, trailingStatic);
+        }
+
+        if (paramNames.Count > _maxParams)
+            _maxParams = paramNames.Count;
+
+        int methodIdx = (int)method;
+        if ((uint)methodIdx >= MethodCount)
+            throw new ArgumentOutOfRangeException(nameof(method));
+
+        current.Handlers[methodIdx] = new HandlerEntry
+        {
+            Handler = handler,
+            ParamNames = paramNames.Count == 0 ? [] : paramNames.ToArray()
+        };
+    }
+
+    private static RadixNode InsertStaticPrefix(RadixNode parent, ReadOnlySpan<byte> prefix)
+    {
+        RadixNode current = parent;
+        ReadOnlySpan<byte> remaining = prefix;
+
+        while (!remaining.IsEmpty)
+        {
+            RadixNode? child = current.FindStaticChildByFirstByte(remaining[0]);
+            if (child == null)
             {
-                match = new RouteMatch(r.Handler, paramList.ToArray());
+                var leaf = new RadixNode(remaining.ToArray());
+                current.AddOrReplaceStaticChild(leaf);
+                return leaf;
+            }
+
+            ReadOnlySpan<byte> childPrefix = child.Prefix;
+            int lcp = CommonPrefixLength(remaining, childPrefix);
+
+            if (lcp < childPrefix.Length)
+            {
+                // Split existing edge at LCP
+                var splitNode = new RadixNode(childPrefix[..lcp].ToArray());
+                child.Prefix = childPrefix[lcp..].ToArray();
+                splitNode.AddOrReplaceStaticChild(child);
+                current.AddOrReplaceStaticChild(splitNode);
+                child = splitNode;
+            }
+
+            remaining = remaining[lcp..];
+            current = child;
+        }
+
+        return current;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int CommonPrefixLength(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
+    {
+        return a.CommonPrefixLength(b);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public bool TryMatch(HttpMethod method, ReadOnlySpan<byte> path, out RouteMatch match)
+    {
+        match = default;
+        int methodIdx = (int)method;
+        if ((uint)methodIdx >= MethodCount || path.IsEmpty)
+            return false;
+
+        // Strip query string (?...) directly on the UTF-8 byte span
+        int qIdx = path.IndexOf((byte)'?');
+        ReadOnlySpan<byte> cleanPath = qIdx >= 0 ? path[..qIdx] : path;
+        if (cleanPath.IsEmpty)
+            return false;
+
+        // Strip trailing '/' when not root "/"
+        while (cleanPath.Length > 1 && cleanPath[^1] == (byte)'/')
+        {
+            cleanPath = cleanPath[..^1];
+        }
+
+        if (_maxParams == 0)
+        {
+            return MatchStaticOnly(_root, methodIdx, cleanPath, out match);
+        }
+
+        int capCapacity = Math.Max(8, _maxParams);
+        Span<(int Offset, int Length)> captures = capCapacity <= 16
+            ? stackalloc (int Offset, int Length)[capCapacity]
+            : new (int Offset, int Length)[capCapacity];
+
+        return MatchNode(_root, methodIdx, cleanPath, 0, captures, 0, out match);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool MatchStaticOnly(RadixNode root, int methodIdx, ReadOnlySpan<byte> cleanPath, out RouteMatch match)
+    {
+        RadixNode current = root;
+        int offset = 0;
+
+        while (offset < cleanPath.Length)
+        {
+            RadixNode? child = current.FindStaticChildByFirstByte(cleanPath[offset]);
+            if (child == null)
+            {
+                match = default;
+                return false;
+            }
+
+            ReadOnlySpan<byte> edge = child.Prefix;
+            if (!cleanPath[offset..].StartsWith(edge))
+            {
+                match = default;
+                return false;
+            }
+
+            offset += edge.Length;
+            current = child;
+        }
+
+        HandlerEntry? entry = current.Handlers[methodIdx];
+        if (entry != null)
+        {
+            match = new RouteMatch(entry.Handler, []);
+            return true;
+        }
+
+        match = default;
+        return false;
+    }
+
+    private static bool MatchNode(
+        RadixNode node,
+        int methodIdx,
+        ReadOnlySpan<byte> cleanPath,
+        int offset,
+        Span<(int Offset, int Length)> captures,
+        int paramDepth,
+        out RouteMatch match)
+    {
+        if (offset == cleanPath.Length)
+        {
+            HandlerEntry? entry = node.Handlers[methodIdx];
+            if (entry != null)
+            {
+                if (paramDepth == 0 || entry.ParamNames.Length == 0)
+                {
+                    match = new RouteMatch(entry.Handler, []);
+                }
+                else
+                {
+                    int count = Math.Min(paramDepth, entry.ParamNames.Length);
+                    var routeParams = new RouteParameter[count];
+                    for (int i = 0; i < count; i++)
+                    {
+                        var (segOffset, segLen) = captures[i];
+                        ReadOnlySpan<byte> rawSeg = cleanPath.Slice(segOffset, segLen);
+                        string val = Encoding.UTF8.GetString(rawSeg);
+                        if (rawSeg.IndexOf((byte)'%') >= 0)
+                        {
+                            try { val = Uri.UnescapeDataString(val); } catch { }
+                        }
+                        routeParams[i] = new RouteParameter(entry.ParamNames[i], val);
+                    }
+                    match = new RouteMatch(entry.Handler, routeParams);
+                }
                 return true;
+            }
+
+            match = default;
+            return false;
+        }
+
+        // 1. Prioritize static prefix edge match
+        RadixNode? staticChild = node.FindStaticChildByFirstByte(cleanPath[offset]);
+        if (staticChild != null)
+        {
+            ReadOnlySpan<byte> edge = staticChild.Prefix;
+            if (cleanPath[offset..].StartsWith(edge))
+            {
+                if (MatchNode(staticChild, methodIdx, cleanPath, offset + edge.Length, captures, paramDepth, out match))
+                {
+                    return true;
+                }
             }
         }
 
+        // 2. Fallback to parametric segment edge up to next '/'
+        RadixNode? paramChild = node.ParametricChild;
+        if (paramChild != null)
+        {
+            ReadOnlySpan<byte> slice = cleanPath[offset..];
+            int slashIdx = slice.IndexOf((byte)'/');
+            int segLen = slashIdx >= 0 ? slashIdx : slice.Length;
+            if (segLen > 0)
+            {
+                captures[paramDepth] = (offset, segLen);
+                if (MatchNode(paramChild, methodIdx, cleanPath, offset + segLen, captures, paramDepth + 1, out match))
+                {
+                    return true;
+                }
+            }
+        }
+
+        match = default;
         return false;
     }
 }

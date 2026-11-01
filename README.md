@@ -43,7 +43,7 @@
    - Sub-10ms Time-To-First-Token (TTFT) under continuous concurrent load.
 
 3. **OpenAI & Ollama Drop-In Compatibility**:
-   - `POST /v1/chat/completions`: Full streaming SSE (`text/event-stream`) and JSON batch completion.
+   - `POST /v1/chat/completions` & `POST /v1/completions`: Full streaming SSE (`text/event-stream`) and JSON batch completion.
    - `GET /v1/models`: Standard OpenAI model registry.
    - `POST /api/chat` & `POST /api/generate`: Ollama-compatible line-delimited NDJSON streaming.
    - `GET /health` & `GET /metrics`: Built-in Prometheus telemetry endpoints.
@@ -77,7 +77,7 @@ Console.WriteLine("🚀 Glacier.Serve active on http://127.0.0.1:5055");
 
 #### OpenAI SDK / cURL:
 ```bash
-curl http://127.0.0.1:5055/v1/chat/completions   -H "Content-Type: application/json"   -d '{"model": "qwen2.5-7b-instruct", "prompt": "Explain PagedAttention:", "maxTokens": 64, "stream": true}'
+curl http://127.0.0.1:5055/v1/chat/completions -H "Content-Type: application/json" -d '{"model": "qwen2.5-7b-instruct", "messages": [{"role": "user", "content": "Explain PagedAttention:"}], "max_tokens": 64, "stream": true}'
 ```
 
 #### Ollama CLI / API:
@@ -119,8 +119,18 @@ curl http://127.0.0.1:5055/api/generate   -H "Content-Type: application/json"   
 ## 📦 NuGet Installation
 
 ```bash
-dotnet add package Glacier.Serve --version 1.1.0
+dotnet add package Glacier.Serve --version 1.2.0
 ```
+
+---
+
+## 🆕 What's New in v1.2.0
+
+- **VRAM-Resident CUDA PagedAttention (`CudaPagedTransformerRunner`)** — Native FP16 GPU block-pool execution backed by `Qwen2GpuModel` SASS/PTX kernels with zero duplicate host KV allocation, plus automatic CPU SIMD (`PagedTransformerRunner`) fallback.
+- **Non-Blocking Chunked Batched Prefill** — Interleaves bounded prompt prefill chunks (`PrefillChunkSize = 128`) with active decode iterations so long prompts never stall in-flight token streams.
+- **Full OpenAI & Ollama Wire Fidelity** — Added `POST /v1/completions`, `snake_case` OpenAI parameters (`max_tokens`, `top_p`, polymorphic `stop`), terminal SSE `finish_reason` chunks, Ollama `options` & `stream: false`, stop-sequence holdback truncation, and stateful UTF-8 incremental token decoding.
+- **UTF-8 Span Radix Tree Router & Complete Arrow IPC** — Genuine compressed UTF-8 prefix/parametric radix routing with query-string isolation, plus lossless `Polaris` `DataFrame` Arrow IPC streaming (`Utf8`, bit-packed `Boolean`, null bitmaps, and EOS markers).
+- **60+ unit and integration tests** passing with `<TreatWarningsAsErrors>true</TreatWarningsAsErrors>` and zero NuGet advisories.
 
 ---
 

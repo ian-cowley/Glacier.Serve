@@ -3,7 +3,7 @@
 **System:** `Glacier.Serve`  
 **Specification Standard:** Arc42 (Version 8.2) & ASD-STE100  
 **Target Platform:** .NET 10 (C# 14) / Native AOT  
-**Repository:** `c:\Users\spuri\source\repos\PolarsPlus\Glacier.Serve`  
+**Repository:** `https://github.com/ian-cowley/Glacier.Serve`  
 **Author:** Glacier Core Engineering Team  
 
 ---
@@ -62,8 +62,9 @@ flowchart LR
 ### 3.2 Technical Context & Interface Protocols
 | Interface | Direction | Protocol / Format | Description |
 | :--- | :---: | :--- | :--- |
-| **OpenAI Chat Endpoint** | Inbound | `POST /v1/chat/completions` (JSON) | Multi-turn chat generation supporting streaming (`stream: true`) and non-streaming responses. |
-| **OpenAI Models Endpoint** | Inbound | `GET /v1/models` (JSON) | Model inventory and capability catalog. |
+| **OpenAI Chat & Text Endpoints** | Inbound | `POST /v1/chat/completions`, `POST /v1/completions` | Chat and text generation supporting streaming (`stream: true`) and non-streaming JSON responses. |
+| **Ollama Endpoints** | Inbound | `POST /api/chat`, `POST /api/generate`, `GET /api/tags` | Ollama-compatible NDJSON streaming and single-shot JSON generation. |
+| **OpenAI Models & Health** | Inbound | `GET /v1/models`, `GET /health` | Model inventory, readiness checks, and capability catalog. |
 | **Metrics Endpoint** | Inbound | `GET /metrics` (JSON / Prometheus) | Real-time telemetry: tokens/sec, active sequences, free block pool capacity. |
 | **Server-Sent Events** | Outbound | `text/event-stream` (`data: {...}\n\n`) | Low-latency token streaming to client pipelines with instant termination on `[DONE]`. |
 
@@ -119,13 +120,16 @@ Glacier.Serve/
 │   │   ├── SequenceState.cs           ── Per-request sequence tracking
 │   │   └── InferenceRequest.cs        ── Standardized request DTO
 │   ├── PagedAttention/
+│   │   ├── IPagedModelRunner.cs       ── Hardware-agnostic paged execution contract
+│   │   ├── CudaPagedTransformerRunner.cs ── VRAM-resident FP16 CUDA PagedAttention runner
 │   │   ├── BlockTable.cs              ── Virtual memory table per sequence
 │   │   ├── PagedBlockPool.cs          ── Physical block allocator & memory pool
 │   │   ├── PagedAttentionKernel.cs    ── Paged attention score reduction kernel
-│   │   └── PagedTransformerRunner.cs  ── Batched transformer execution engine
+│   │   └── PagedTransformerRunner.cs  ── CPU SIMD batched transformer execution engine
 │   └── Http/
-│       ├── OpenAiEndpoints.cs         ── /v1/chat/completions & /v1/models handlers
-│       └── MetricsEndpoint.cs         ── Prometheus and JSON metrics endpoint
+│       ├── OpenAiEndpoints.cs         ── /v1/chat/completions, /v1/completions & /v1/models
+│       ├── OllamaEndpoints.cs         ── /api/chat, /api/generate & /api/tags
+│       └── MetricsEndpoint.cs         ── /health, Prometheus and JSON metrics endpoint
 └── Server/
     ├── GlacierServeApp.cs             ── Core socket server and connection lifecycle
     └── GlacierServeBuilder.cs         ── Fluent host configuration builder
@@ -200,10 +204,10 @@ sequenceDiagram
 
 ## 7. Deployment View
 
-### 7.1 Windows Direct Execution
-`Glacier.Serve` is distributed as a single Native AOT compiled binary (`Glacier.Serve.exe`).
-- **Dependencies:** Direct link to OS driver shims (`nvcuda.dll` or `d3d12.dll`). Zero external DLL installations required.
-- **Port:** Default HTTP binding on port `5000` (configurable via `appsettings.json` or CLI `--port`).
+### 7.1 Embeddable Library & Native AOT Host Integration
+`Glacier.Serve` is packaged as an AOT-compatible NuGet library (`Glacier.Serve`) embedded via `GlacierServeApp.CreateBuilder()`.
+- **Dependencies:** Direct P/Invoke link to OS driver shims (`nvcuda.dll` or `d3d12.dll`) via `Glacier.Inference`. Zero Python or external C++ runtime wrappers required.
+- **Port:** Default HTTP binding on `127.0.0.1:8080` (configurable via `.UseHost(...)` and `.UsePort(...)`).
 - **GPU Requirements:** NVIDIA Driver $\ge 535$ for CUDA/SASS execution; Windows 10/11 with DirectX 12 Feature Level 12.0 for D3D12 execution.
 
 ---

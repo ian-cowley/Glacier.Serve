@@ -24,7 +24,14 @@ BenchmarkDotNet.Artifacts/
 
 # NuGet
 *.nupkg
+*.snupkg
 packages/
+artifacts/
+TestResults/
+
+# Model weights
+*.gguf
+models/
 
 # Logs
 *.log
@@ -37,3 +44,12 @@ Thumbs.db
 # Scratch / working directories
 brain/
 scratch/
+
+# Secrets, configuration & environment files
+appsettings*.json
+!appsettings.template.json
+*.env*
+*.key
+*.pem
+secrets*.json
+

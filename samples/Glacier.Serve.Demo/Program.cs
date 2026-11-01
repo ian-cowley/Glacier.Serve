@@ -8,6 +8,7 @@ using System.Net.Http.Json;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading.Tasks;
 using Glacier.Polaris;
 using Glacier.Polaris.Data;
@@ -18,6 +19,32 @@ using Glacier.Serve.Inference.PagedAttention;
 using Glacier.Serve.Serialization;
 using Glacier.Serve.Server;
 using Glacier.Tensor.Core;
+
+public sealed class DemoStatusResponse
+{
+    [JsonPropertyName("status")]
+    public string Status { get; set; } = "healthy";
+
+    [JsonPropertyName("runtime")]
+    public string Runtime { get; set; } = ".NET 10.0";
+
+    [JsonPropertyName("aot")]
+    public bool Aot { get; set; } = true;
+
+    [JsonPropertyName("engine")]
+    public string Engine { get; set; } = "Glacier.Serve";
+
+    [JsonPropertyName("paged_attention")]
+    public bool PagedAttention { get; set; } = true;
+
+    [JsonPropertyName("uptimeMs")]
+    public long UptimeMs { get; set; }
+}
+
+[JsonSerializable(typeof(DemoStatusResponse))]
+internal partial class DemoJsonContext : JsonSerializerContext
+{
+}
 
 public static class Program
 {
@@ -51,15 +78,10 @@ public static class Program
             })
             .MapGet("/api/status", async ctx =>
             {
-                await ctx.Response.WriteJsonAsync(new
+                await ctx.Response.WriteJsonAsync(new DemoStatusResponse
                 {
-                    status = "healthy",
-                    runtime = ".NET 10.0",
-                    aot = true,
-                    engine = "Glacier.Serve",
-                    paged_attention = true,
-                    uptimeMs = Environment.TickCount64
-                });
+                    UptimeMs = Environment.TickCount64
+                }, DemoJsonContext.Default.DemoStatusResponse);
             })
             .MapGet("/api/sales/{region}", async ctx =>
             {
@@ -159,9 +181,9 @@ public static class Program
         Console.WriteLine($"  ✓ Average Roundtrip Latency: {avgLatencyMs:F3} ms / request");
         Console.WriteLine($"  ✓ Single-Client Sequential Throughput: {reqsPerSec:F0} req/sec\n");
 
-        // Check if GGUF model is available for live inference verification
-        string modelPath = @"D:\lmstudio\models\lmstudio-community\Qwen2.5-7B-Instruct-1M-GGUF\Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf";
-        if (File.Exists(modelPath))
+        // Check if GGUF model is provided via --model <path>, positional arg, or GLACIER_MODEL_PATH
+        string? modelPath = ResolveModelPath(args);
+        if (!string.IsNullOrWhiteSpace(modelPath) && File.Exists(modelPath))
         {
             Console.ForegroundColor = ConsoleColor.Yellow;
             Console.WriteLine("[5/5] Mounting ContinuousBatchEngine & Testing Live Endpoints...");
@@ -207,8 +229,8 @@ public static class Program
             };
 
             var swInfer = Stopwatch.StartNew();
-            var task1 = client.PostAsJsonAsync("/v1/chat/completions", promptReq1);
-            var task2 = client.PostAsJsonAsync("/v1/chat/completions", promptReq2);
+            var task1 = client.PostAsJsonAsync("/v1/chat/completions", promptReq1, ServeJsonContext.Default.InferenceRequest);
+            var task2 = client.PostAsJsonAsync("/v1/chat/completions", promptReq2, ServeJsonContext.Default.InferenceRequest);
 
             await Task.WhenAll(task1, task2);
             swInfer.Stop();
@@ -238,7 +260,7 @@ public static class Program
 
             using var streamMsg = new HttpRequestMessage(System.Net.Http.HttpMethod.Post, "/v1/chat/completions")
             {
-                Content = JsonContent.Create(streamReq)
+                Content = JsonContent.Create(streamReq, ServeJsonContext.Default.InferenceRequest)
             };
             var streamRes = await client.SendAsync(streamMsg, HttpCompletionOption.ResponseHeadersRead);
             using var streamReader = new StreamReader(await streamRes.Content.ReadAsStreamAsync());
@@ -250,15 +272,18 @@ public static class Program
                 if (line.StartsWith("data: ") && !line.Contains("[DONE]"))
                 {
                     using var doc = JsonDocument.Parse(line[6..]);
-                    string delta = doc.RootElement.GetProperty("choices")[0].GetProperty("delta").GetProperty("content").GetString() ?? "";
-                    Console.Write(delta);
+                    var deltaObj = doc.RootElement.GetProperty("choices")[0].GetProperty("delta");
+                    if (deltaObj.TryGetProperty("content", out var contentProp))
+                    {
+                        Console.Write(contentProp.GetString() ?? "");
+                    }
                 }
             }
             Console.WriteLine("\n");
 
             // Test Ollama endpoint
             Console.ForegroundColor = ConsoleColor.Cyan;
-            Console.WriteLine("[Ollama Compatibility Demo] POST /api/generate (NDJSON stream)...");
+            Console.WriteLine("[Ollama Compatibility Demo] POST /api/generate (JSON / NDJSON)...");
             Console.ResetColor();
 
             var ollamaReq = new InferenceRequest
@@ -270,7 +295,7 @@ public static class Program
             };
             using var ollamaMsg = new HttpRequestMessage(System.Net.Http.HttpMethod.Post, "/api/generate")
             {
-                Content = JsonContent.Create(ollamaReq)
+                Content = JsonContent.Create(ollamaReq, ServeJsonContext.Default.InferenceRequest)
             };
             var ollamaRes = await client.SendAsync(ollamaMsg, HttpCompletionOption.ResponseHeadersRead);
             using var ollamaReader = new StreamReader(await ollamaRes.Content.ReadAsStreamAsync());
@@ -287,11 +312,27 @@ public static class Program
             }
             Console.WriteLine("\n");
         }
+        else
+        {
+            Console.WriteLine("  [Info] Skipping live GGUF model demo (pass --model <path-to-gguf> or set GLACIER_MODEL_PATH).\n");
+        }
 
         Console.ForegroundColor = ConsoleColor.Green;
         Console.WriteLine("================================================================================");
         Console.WriteLine("    ALL DEMOS COMPLETED SUCCESSFULLY: GLACIER.SERVE PILLAR 3 IS VERIFIED!       ");
         Console.WriteLine("================================================================================");
         Console.ResetColor();
+    }
+
+    private static string? ResolveModelPath(string[] args)
+    {
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (args[i].Equals("--model", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+                return args[i + 1];
+            if (!args[i].StartsWith('-'))
+                return args[i];
+        }
+        return Environment.GetEnvironmentVariable("GLACIER_MODEL_PATH");
     }
 }

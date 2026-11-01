@@ -31,12 +31,19 @@ public static unsafe class PagedAttentionKernel
         int maxSeqLen,
         float? sinkLogit = null)
     {
-        int totalTokens = blockTable.TokenCount;
+        if (maxSeqLen <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxSeqLen), maxSeqLen, "maxSeqLen must be positive.");
+        if (pos < 0 || pos >= maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(pos), pos, $"Token position {pos} exceeds valid sequence range [0, {maxSeqLen - 1}].");
+        if (blockTable.TokenCount > maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(blockTable), blockTable.TokenCount, $"BlockTable token count {blockTable.TokenCount} exceeds maxSeqLen {maxSeqLen}.");
+
+        int totalTokens = Math.Min(blockTable.TokenCount, pos + 1);
         if (totalTokens == 0) return;
 
         int groupSize = nHeads / nHeadsKv;
-        int blockCount = blockTable.BlockCount;
         int blockSize = pool.BlockSize;
+        int blockCount = (totalTokens + blockSize - 1) / blockSize;
 
         Parallel.For(0, nHeads, h =>
         {

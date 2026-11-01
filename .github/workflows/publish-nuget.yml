@@ -6,21 +6,32 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
       contents: write
       packages: write
+      id-token: write
     env:
       DOTNET_CLI_TELEMETRY_OPTOUT: 1
-      NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Configure runner swap
+        run: |
+          sudo fallocate -l 8G /mnt/swapfile_extra || sudo dd if=/dev/zero of=/mnt/swapfile_extra bs=1M count=8192
+          sudo chmod 600 /mnt/swapfile_extra
+          sudo mkswap /mnt/swapfile_extra
+          sudo swapon /mnt/swapfile_extra
 
       - name: Setup .NET 10
         uses: actions/setup-dotnet@v4
@@ -32,6 +43,24 @@ jobs:
           mkdir -p ../nuget-local
           dotnet nuget add source --name "github-packages" --username "${{ github.repository_owner }}" --password "${{ secrets.GITHUB_TOKEN }}" --store-password-in-clear-text "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" || true
 
+      - name: Wait for upstream NuGet packages to be available
+        run: |
+          wait_for_restore() {
+            local timeout=1200 elapsed=0
+            echo "Waiting for upstream package Glacier.Inference 1.3.2 to resolve via configured feeds..."
+            until dotnet restore src/Glacier.Serve/Glacier.Serve.csproj > /dev/null 2>&1; do
+              if [ $elapsed -ge $timeout ]; then
+                echo "TIMEOUT waiting for upstream packages to restore. Diagnostics:"
+                dotnet restore src/Glacier.Serve/Glacier.Serve.csproj
+                exit 1
+              fi
+              echo "  Packages not yet resolvable, retrying in 30s (${elapsed}s elapsed)..."
+              sleep 30; elapsed=$((elapsed+30))
+            done
+            echo "  All upstream dependencies successfully resolved."
+          }
+          wait_for_restore
+
       - name: Restore dependencies
         run: dotnet restore
 
@@ -39,18 +68,27 @@ jobs:
         run: dotnet build --configuration Release --no-restore
 
       - name: Run tests
-        run: dotnet test tests/Glacier.Serve.Tests/Glacier.Serve.Tests.csproj --configuration Release --no-restore --no-build
+        run: dotnet test tests/Glacier.Serve.Tests/Glacier.Serve.Tests.csproj --configuration Release --no-restore --no-build --blame-hang --blame-hang-dump-type none --blame-hang-timeout 60s --logger "console;verbosity=normal"
 
       - name: Pack
-        run: dotnet pack src/Glacier.Serve/Glacier.Serve.csproj --configuration Release --output packages
-
-      - name: Publish to nuget.org
-        if: env.NUGET_API_KEY != '' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/'))
-        run: dotnet nuget push "packages/*.nupkg" --api-key $NUGET_API_KEY --source https://api.nuget.org/v3/index.json --skip-duplicate || true
+        run: dotnet pack src/Glacier.Serve/Glacier.Serve.csproj --configuration Release --no-build --output packages
 
       - name: Publish to GitHub Packages
         if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')
-        run: dotnet nuget push "packages/*.nupkg" --api-key ${{ secrets.GITHUB_TOKEN }} --source https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json --skip-duplicate || true
+        run: dotnet nuget push "packages/*.nupkg" --api-key ${{ secrets.GITHUB_TOKEN }} --source https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json --skip-duplicate
+
+      - name: NuGet login (Trusted Publishing OIDC)
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: spuriousbugfix
+
+      - name: Publish to nuget.org
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')
+        env:
+          NUGET_OIDC_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
+        run: dotnet nuget push "packages/*.nupkg" --api-key "$NUGET_OIDC_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')

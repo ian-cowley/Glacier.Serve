@@ -21,7 +21,7 @@ using Xunit;
 /// </summary>
 public class ContinuousBatchingLoadChallengeTests
 {
-    private const string RealModelPath = @"D:\lmstudio\models\lmstudio-community\DeepSeek-R1-Distill-Qwen-7B-GGUF\DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf";
+    private static string? RealModelPath => Environment.GetEnvironmentVariable("GLACIER_MODEL_PATH");
 
     /// <summary>
     /// Challenge 1: Concurrent sequences in the same batch where Sequence A has an infinite reasoning loop
@@ -536,13 +536,14 @@ public class ContinuousBatchingLoadChallengeTests
     [Fact]
     public async Task Challenge_LiveModel_ConcurrentHeterogeneousSequences_Execution()
     {
-        if (!File.Exists(RealModelPath))
+        string? modelPath = RealModelPath;
+        if (string.IsNullOrWhiteSpace(modelPath) || !File.Exists(modelPath))
         {
-            // Skip if model not present on this machine
+            // Skip if GLACIER_MODEL_PATH is not configured or model is not present on this machine
             return;
         }
 
-        using var engine = new ContinuousBatchEngine(RealModelPath, totalKvBlocks: 256, maxBatchSize: 4);
+        using var engine = new ContinuousBatchEngine(modelPath, totalKvBlocks: 256, maxBatchSize: 4);
 
         var requests = new (string Name, InferenceRequest Request)[]
         {

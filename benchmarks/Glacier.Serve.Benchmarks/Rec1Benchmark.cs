@@ -7,6 +7,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading.Tasks;
 using Glacier.Inference.Sampling;
 using Glacier.Serve.Inference.Batching;
@@ -82,6 +83,14 @@ public sealed class BenchmarkSuiteReport
     public int TotalTokensSaved { get; set; }
     public int FalsePositiveCount { get; set; }
     public List<BenchmarkRunRecord> Runs { get; init; } = [];
+}
+
+[JsonSourceGenerationOptions(WriteIndented = true)]
+[JsonSerializable(typeof(BenchmarkPromptDefinition))]
+[JsonSerializable(typeof(BenchmarkRunRecord))]
+[JsonSerializable(typeof(BenchmarkSuiteReport))]
+internal partial class BenchmarkJsonContext : JsonSerializerContext
+{
 }
 
 /// <summary>
@@ -191,10 +200,7 @@ public static class Rec1Benchmark
 
     public static async Task<int> RunAsync(string[] args)
     {
-        string defaultModelPath = @"D:\lmstudio\models\lmstudio-community\DeepSeek-R1-Distill-Qwen-7B-GGUF\DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf";
-        string fallbackModelPath = @"D:\lmstudio\models\lmstudio-community\Qwen3-4B-Thinking-2507-GGUF\Qwen3-4B-Thinking-2507-Q4_K_M.gguf";
-
-        string modelPath = defaultModelPath;
+        string? modelPath = Environment.GetEnvironmentVariable("GLACIER_MODEL_PATH");
         int? globalMaxTokens = null;
         int runs = 1;
         float temp = 0.0f; // Deterministic greedy by default
@@ -237,23 +243,13 @@ public static class Rec1Benchmark
 
         phase ??= disableLoopGuard ? "Pre-Change Baseline" : "Post-Change";
 
-        if (!File.Exists(modelPath))
+        if (string.IsNullOrWhiteSpace(modelPath) || !File.Exists(modelPath))
         {
-            if (File.Exists(fallbackModelPath))
-            {
-                Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine($"[WARN] Target model '{modelPath}' not found. Falling back to '{fallbackModelPath}'.");
-                Console.ResetColor();
-                modelPath = fallbackModelPath;
-            }
-            else
-            {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"[ERROR] Neither target model '{modelPath}' nor fallback '{fallbackModelPath}' was found!");
-                Console.WriteLine("[STOP] Requirement R2 states: If no real model can be run in this environment, STOP and report.");
-                Console.ResetColor();
-                return 1;
-            }
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"[ERROR] Model file was not found (resolved path: '{modelPath ?? "<unset>"}').");
+            Console.WriteLine("        Provide --model <path-to-gguf> or set the GLACIER_MODEL_PATH environment variable.");
+            Console.ResetColor();
+            return 1;
         }
 
         long fileSizeBytes = new FileInfo(modelPath).Length;
@@ -265,7 +261,7 @@ public static class Rec1Benchmark
             try
             {
                 string baseJson = await File.ReadAllTextAsync(baselineJsonPath);
-                var baseReport = JsonSerializer.Deserialize<BenchmarkSuiteReport>(baseJson);
+                var baseReport = JsonSerializer.Deserialize(baseJson, BenchmarkJsonContext.Default.BenchmarkSuiteReport);
                 if (baseReport?.Runs != null)
                 {
                     baselineLookup = new Dictionary<string, BenchmarkRunRecord>(StringComparer.OrdinalIgnoreCase);
@@ -624,7 +620,7 @@ public static class Rec1Benchmark
             if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
         }
 
-        string json = JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true });
+        string json = JsonSerializer.Serialize(report, BenchmarkJsonContext.Default.BenchmarkSuiteReport);
         await File.WriteAllTextAsync(jsonOutputPath, json);
         Console.WriteLine($"  ✓ Exported Full JSON Results:     {Path.GetFullPath(jsonOutputPath)}");
         Console.WriteLine("==========================================================================================");

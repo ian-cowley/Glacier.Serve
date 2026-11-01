@@ -3,12 +3,18 @@
     <Project Path="src/Glacier.Serve/Glacier.Serve.csproj" />
   </Folder>
   <Folder Name="/tests/">
-    <Project Path="tests/Glacier.Serve.Tests/Glacier.Serve.Tests.csproj" />
+    <Project Path="tests/Glacier.Serve.Tests/Glacier.Serve.Tests.csproj">
+      <BuildDependency Project="src/Glacier.Serve/Glacier.Serve.csproj" />
+    </Project>
   </Folder>
   <Folder Name="/benchmarks/">
-    <Project Path="benchmarks/Glacier.Serve.Benchmarks/Glacier.Serve.Benchmarks.csproj" />
+    <Project Path="benchmarks/Glacier.Serve.Benchmarks/Glacier.Serve.Benchmarks.csproj">
+      <BuildDependency Project="src/Glacier.Serve/Glacier.Serve.csproj" />
+    </Project>
   </Folder>
   <Folder Name="/samples/">
-    <Project Path="samples/Glacier.Serve.Demo/Glacier.Serve.Demo.csproj" />
+    <Project Path="samples/Glacier.Serve.Demo/Glacier.Serve.Demo.csproj">
+      <BuildDependency Project="src/Glacier.Serve/Glacier.Serve.csproj" />
+    </Project>
   </Folder>
 </Solution>

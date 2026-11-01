@@ -47,8 +47,8 @@ Physical PagedBlockPool (Scattered Physical Memory Pages):
 
 ### 2.1 The Physical Pool: `PagedBlockPool`
 `PagedBlockPool` manages an unmanaged arena in device or host memory. It allocates blocks of fixed size $B_s = 16$ tokens:
-- Each block stores Key and Value tensors for all layers:
-  $$\text{BlockSizeInBytes} = N_{\text{layers}} \times 2 \times B_s \times N_{\text{headsKV}} \times d_{\text{head}} \times \text{sizeof}(\text{float})$$
+- Each block stores Key and Value tensors for all layers (FP16 `sizeof(ushort) = 2` bytes in GPU VRAM via `CudaPagedTransformerRunner`, or 64-byte aligned FP32 `sizeof(float) = 4` bytes in host memory via `PagedBlockPool`):
+  $$\text{BlockSizeInBytes} = N_{\text{layers}} \times 2 \times B_s \times N_{\text{headsKV}} \times d_{\text{head}} \times \text{ElementBytes}$$
 - Blocks are allocated dynamically on-demand from a lock-free free-list.
 - When a sequence completes, its allocated blocks are instantly returned to the free list in $O(K)$ time (where $K$ is the number of blocks).
 

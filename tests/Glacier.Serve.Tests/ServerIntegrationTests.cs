@@ -3,9 +3,17 @@ namespace Glacier.Serve.Tests;
 using System;
 using System.Net.Http;
 using System.Net.Sockets;
+using System.Text.Json.Serialization;
 using System.Threading.Tasks;
 using Glacier.Serve.Server;
 using Xunit;
+
+public sealed record TestStatusDto(string status, string version);
+
+[JsonSerializable(typeof(TestStatusDto))]
+internal partial class TestServerJsonContext : JsonSerializerContext
+{
+}
 
 public class ServerIntegrationTests
 {
@@ -30,7 +38,9 @@ public class ServerIntegrationTests
             })
             .MapGet("/api/json", async ctx =>
             {
-                await ctx.Response.WriteJsonAsync(new { status = "operational", version = "1.0.0" });
+                await ctx.Response.WriteJsonAsync(
+                    new TestStatusDto("operational", "1.2.0"),
+                    TestServerJsonContext.Default.TestStatusDto);
             })
             .MapGet("/users/{id}", async ctx =>
             {

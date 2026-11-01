@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 namespace Glacier.Serve.Inference.PagedAttention;
 
@@ -63,6 +64,12 @@ public sealed class BlockTable
     {
         return _physicalBlockIds[blockIndex];
     }
+
+    /// <summary>
+    /// Zero-allocation contiguous span view of physical block IDs for direct HtoD transfer.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public ReadOnlySpan<int> AsSpan() => CollectionsMarshal.AsSpan(_physicalBlockIds);
 
     /// <summary>
     /// Recycles all physical blocks back to the pool and resets sequence state.

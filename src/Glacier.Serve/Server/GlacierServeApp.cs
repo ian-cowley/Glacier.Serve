@@ -2,6 +2,7 @@ namespace Glacier.Serve.Server;
 
 using System;
 using System.Buffers;
+using System.Globalization;
 using System.IO.Pipelines;
 using System.Net;
 using System.Net.Sockets;
@@ -15,9 +16,12 @@ using Glacier.Serve.Routing;
 
 public sealed class GlacierServeApp : IDisposable
 {
+    public const long DefaultMaxRequestBodySize = 32L * 1024 * 1024; // 32 MB
+
     private readonly int _port;
     private readonly IPAddress _address;
     private readonly RadixTreeRouter _router;
+    private long _maxRequestBodySize;
     private TcpListener? _listener;
     private CancellationTokenSource? _cts;
     private Task? _listenTask;
@@ -25,11 +29,22 @@ public sealed class GlacierServeApp : IDisposable
     public int Port => _port;
     public bool IsRunning => _listener != null;
 
-    internal GlacierServeApp(IPAddress address, int port, RadixTreeRouter router)
+    public long MaxRequestBodySize
+    {
+        get => Interlocked.Read(ref _maxRequestBodySize);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfLessThan(value, 0);
+            Interlocked.Exchange(ref _maxRequestBodySize, value);
+        }
+    }
+
+    internal GlacierServeApp(IPAddress address, int port, RadixTreeRouter router, long maxRequestBodySize = DefaultMaxRequestBodySize)
     {
         _address = address;
         _port = port;
         _router = router;
+        _maxRequestBodySize = maxRequestBodySize;
     }
 
     public static GlacierServeBuilder CreateBuilder(string[]? args = null) => new();
@@ -124,19 +139,35 @@ public sealed class GlacierServeApp : IDisposable
         using var stream = new NetworkStream(socket, ownsSocket: true);
         var reader = PipeReader.Create(stream);
         var writer = PipeWriter.Create(stream);
+        using var connCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
         try
         {
-            while (!ct.IsCancellationRequested)
+            while (!connCts.IsCancellationRequested)
             {
-                var readResult = await reader.ReadAsync(ct).ConfigureAwait(false);
+                var readResult = await reader.ReadAsync(connCts.Token).ConfigureAwait(false);
                 var buffer = readResult.Buffer;
 
                 if (buffer.IsEmpty && readResult.IsCompleted) break;
 
-                // Zero-copy network ingress parsing using ReadOnlySequence<byte> and pooled/stackalloc buffers
-                if (!TryParseRequestHeaders(buffer, out var method, out var path, out var headers, out int totalConsumed))
+                if (!TryParseRequestAndMatchRoute(
+                    buffer,
+                    _router,
+                    out var method,
+                    out var path,
+                    out var queryString,
+                    out var headers,
+                    out bool routeMatched,
+                    out var routeMatch,
+                    out int headerBytesConsumed))
                 {
+                    if (buffer.Length >= 16384)
+                    {
+                        var errResp = new HttpResponse(writer) { StatusCode = 431 };
+                        errResp.Headers["Connection"] = "close";
+                        await errResp.WriteUtf8Async("{\"error\":\"Request Header Fields Too Large\"}", connCts.Token).ConfigureAwait(false);
+                        break;
+                    }
                     reader.AdvanceTo(buffer.Start, buffer.End);
                     if (readResult.IsCompleted) break;
                     continue;
@@ -146,6 +177,7 @@ public sealed class GlacierServeApp : IDisposable
                 {
                     Method = method,
                     Path = path,
+                    QueryString = queryString,
                     BodyReader = reader
                 };
                 foreach (var (k, v) in headers)
@@ -153,113 +185,110 @@ public sealed class GlacierServeApp : IDisposable
                     request.Headers[k] = v;
                 }
 
+                var response = new HttpResponse(writer);
+                long maxBodyBytes = MaxRequestBodySize;
+
+                // Advance past parsed HTTP request headers before reading body
+                buffer = buffer.Slice(headerBytesConsumed);
+                reader.AdvanceTo(buffer.Start);
+
                 if (request.Header("Transfer-Encoding")?.Contains("chunked", StringComparison.OrdinalIgnoreCase) == true)
                 {
-                    using var ms = new MemoryStream();
-                    int chunkOffset = totalConsumed;
-                    while (true)
+                    var chunkBodyStatus = await ReadChunkedBodyAsync(reader, buffer, readResult.IsCompleted, maxBodyBytes, request, connCts.Token).ConfigureAwait(false);
+                    if (chunkBodyStatus == BodyReadStatus.PayloadTooLarge)
                     {
-                        var remainingBytes = buffer.Slice(chunkOffset).ToArray();
-                        int crlf = HttpSimdParser.IndexOfCrlfVector256(remainingBytes.AsSpan());
-                        if (crlf < 0)
-                        {
-                            reader.AdvanceTo(buffer.Start, buffer.End);
-                            readResult = await reader.ReadAsync(ct).ConfigureAwait(false);
-                            buffer = readResult.Buffer;
-                            remainingBytes = buffer.Slice(chunkOffset).ToArray();
-                            crlf = HttpSimdParser.IndexOfCrlfVector256(remainingBytes.AsSpan());
-                            if (crlf < 0) break;
-                        }
-
-                        string hexStr = Encoding.ASCII.GetString(remainingBytes, 0, crlf).Trim();
-                        if (!int.TryParse(hexStr, System.Globalization.NumberStyles.HexNumber, null, out int chunkSize))
-                            break;
-
-                        int lineEndLen = (remainingBytes[crlf] == (byte)'\r' && remainingBytes.Length > crlf + 1 && remainingBytes[crlf + 1] == (byte)'\n') ? 2 : 1;
-                        chunkOffset += crlf + lineEndLen;
-
-                        if (chunkSize == 0)
-                        {
-                            if (buffer.Length >= chunkOffset + 2) chunkOffset += 2;
-                            break;
-                        }
-
-                        while (buffer.Length < chunkOffset + chunkSize)
-                        {
-                            reader.AdvanceTo(buffer.Start, buffer.End);
-                            readResult = await reader.ReadAsync(ct).ConfigureAwait(false);
-                            buffer = readResult.Buffer;
-                        }
-
-                        var chunkBytes = buffer.Slice(chunkOffset, chunkSize).ToArray();
-                        ms.Write(chunkBytes, 0, chunkBytes.Length);
-                        chunkOffset += chunkSize;
-
-                        if (buffer.Length >= chunkOffset + 2)
-                        {
-                            var crlfCheck = buffer.Slice(chunkOffset, 2).ToArray();
-                            if (crlfCheck[0] == '\r' && crlfCheck[1] == '\n') chunkOffset += 2;
-                            else if (crlfCheck[0] == '\n') chunkOffset += 1;
-                        }
+                        response.StatusCode = 413;
+                        response.Headers["Connection"] = "close";
+                        await response.WriteUtf8Async("{\"error\":\"Payload Too Large\"}", connCts.Token).ConfigureAwait(false);
+                        break;
+                    }
+                    if (chunkBodyStatus == BodyReadStatus.BadRequest)
+                    {
+                        response.StatusCode = 400;
+                        response.Headers["Connection"] = "close";
+                        await response.WriteUtf8Async("{\"error\":\"Malformed chunked transfer encoding\"}", connCts.Token).ConfigureAwait(false);
+                        break;
+                    }
+                }
+                else if (request.Header("Content-Length") is string clStr)
+                {
+                    if (!long.TryParse(clStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out long contentLength) || contentLength < 0)
+                    {
+                        response.StatusCode = 400;
+                        response.Headers["Connection"] = "close";
+                        await response.WriteUtf8Async("{\"error\":\"Invalid Content-Length header\"}", connCts.Token).ConfigureAwait(false);
+                        break;
                     }
 
-                    request.Body = ms.ToArray();
-                    totalConsumed = chunkOffset;
-                }
-                else if (request.Header("Content-Length") is string clStr && int.TryParse(clStr, out int clVal))
-                {
-                    int contentLength = clVal;
-                    while (buffer.Length < totalConsumed + contentLength)
+                    if (contentLength > maxBodyBytes || contentLength > int.MaxValue)
+                    {
+                        response.StatusCode = 413;
+                        response.Headers["Connection"] = "close";
+                        await response.WriteUtf8Async("{\"error\":\"Payload Too Large\"}", connCts.Token).ConfigureAwait(false);
+                        break;
+                    }
+
+                    int expectedLen = (int)contentLength;
+                    while (buffer.Length < expectedLen)
                     {
                         reader.AdvanceTo(buffer.Start, buffer.End);
-                        readResult = await reader.ReadAsync(ct).ConfigureAwait(false);
+                        readResult = await reader.ReadAsync(connCts.Token).ConfigureAwait(false);
                         buffer = readResult.Buffer;
-                        if (readResult.IsCompleted && buffer.Length < totalConsumed + contentLength) break;
+                        if (readResult.IsCompleted && buffer.Length < expectedLen) break;
                     }
 
-                    if (contentLength > 0 && buffer.Length >= totalConsumed + contentLength)
+                    if (expectedLen > 0)
                     {
-                        var bodySlice = buffer.Slice(totalConsumed, contentLength);
-                        if (bodySlice.IsSingleSegment)
+                        if (buffer.Length < expectedLen)
                         {
-                            request.Body = bodySlice.First;
+                            // Truncated socket stream
+                            break;
                         }
-                        else
-                        {
-                            byte[] bodyBytes = GC.AllocateUninitializedArray<byte>(contentLength);
-                            bodySlice.CopyTo(bodyBytes);
-                            request.Body = bodyBytes;
-                        }
-                        totalConsumed += contentLength;
+
+                        var bodySlice = buffer.Slice(0, expectedLen);
+                        byte[] bodyBytes = GC.AllocateUninitializedArray<byte>(expectedLen);
+                        bodySlice.CopyTo(bodyBytes);
+                        request.Body = bodyBytes;
+                        reader.AdvanceTo(buffer.GetPosition(expectedLen));
                     }
                 }
 
-                reader.AdvanceTo(buffer.GetPosition(totalConsumed));
-
-                var response = new HttpResponse(writer);
-                var context = new HttpContext(request, response, ct);
-
-                if (TryMatchRoute(_router, method, request.Path, out var match))
+                var context = new HttpContext(request, response, connCts.Token)
                 {
-                    if (match.Parameters != null)
+                    ClientDisconnectProbe = () =>
                     {
-                        foreach (var p in match.Parameters)
+                        try
                         {
+                            return socket.Poll(0, SelectMode.SelectRead) && socket.Available == 0;
+                        }
+                        catch
+                        {
+                            return true;
+                        }
+                    }
+                };
+
+                if (routeMatched)
+                {
+                    if (routeMatch.Parameters != null)
+                    {
+                        for (int i = 0; i < routeMatch.Parameters.Length; i++)
+                        {
+                            var p = routeMatch.Parameters[i];
                             request.RouteParams[p.Name] = p.Value;
                         }
                     }
 
-                    await match.Handler(context).ConfigureAwait(false);
+                    await routeMatch.Handler(context).ConfigureAwait(false);
                 }
                 else
                 {
                     response.StatusCode = 404;
-                    await response.WriteUtf8Async("404 Not Found").ConfigureAwait(false);
+                    await response.WriteUtf8Async("404 Not Found", connCts.Token).ConfigureAwait(false);
                 }
 
-                // Check Connection header from request or response
                 if (request.Header("Connection")?.Equals("close", StringComparison.OrdinalIgnoreCase) == true ||
-                    response.Headers.TryGetValue("Connection", out var respConn) && respConn.Equals("close", StringComparison.OrdinalIgnoreCase))
+                    (response.Headers.TryGetValue("Connection", out var respConn) && respConn.Equals("close", StringComparison.OrdinalIgnoreCase)))
                 {
                     break;
                 }
@@ -267,17 +296,242 @@ public sealed class GlacierServeApp : IDisposable
         }
         catch (OperationCanceledException)
         {
+            connCts.Cancel();
             GlacierDiagnostics.LogDebug("[Glacier.Serve] Connection processing cancelled.");
         }
         catch (Exception ex)
         {
+            connCts.Cancel();
             GlacierDiagnostics.LogError($"[Glacier.Serve] ProcessConnectionAsync error: {ex.Message}", ex);
         }
         finally
         {
-            await reader.CompleteAsync().ConfigureAwait(false);
-            await writer.CompleteAsync().ConfigureAwait(false);
+            connCts.Cancel();
+            try { await reader.CompleteAsync().ConfigureAwait(false); } catch { }
+            try { await writer.CompleteAsync().ConfigureAwait(false); } catch { }
         }
+    }
+
+    private enum BodyReadStatus
+    {
+        Ok,
+        PayloadTooLarge,
+        BadRequest
+    }
+
+    private static async ValueTask<BodyReadStatus> ReadChunkedBodyAsync(
+        PipeReader reader,
+        ReadOnlySequence<byte> buffer,
+        bool isCompleted,
+        long maxBodyBytes,
+        HttpRequest request,
+        CancellationToken ct)
+    {
+        var bodyWriter = new ArrayBufferWriter<byte>(1024);
+        long totalBytes = 0;
+
+        while (true)
+        {
+            int headerLineEnd;
+            int headerConsumed;
+            long chunkSize;
+
+            while (!TryParseChunkSizeLine(buffer, out chunkSize, out headerLineEnd, out headerConsumed))
+            {
+                if (headerLineEnd == -2)
+                    return BodyReadStatus.BadRequest;
+
+                if (isCompleted)
+                    return BodyReadStatus.BadRequest;
+
+                reader.AdvanceTo(buffer.Start, buffer.End);
+                var rr = await reader.ReadAsync(ct).ConfigureAwait(false);
+                buffer = rr.Buffer;
+                isCompleted = rr.IsCompleted;
+            }
+
+            if (chunkSize < 0)
+                return BodyReadStatus.BadRequest;
+
+            if (totalBytes + chunkSize > maxBodyBytes || totalBytes + chunkSize > int.MaxValue)
+                return BodyReadStatus.PayloadTooLarge;
+
+            buffer = buffer.Slice(headerConsumed);
+            reader.AdvanceTo(buffer.Start);
+
+            if (chunkSize == 0)
+            {
+                // Consume optional chunked trailer headers up to empty line (\r\n or \n)
+                while (true)
+                {
+                    int trailerCrlf = ConsumeLeadingCrlf(buffer);
+                    if (trailerCrlf > 0)
+                    {
+                        reader.AdvanceTo(buffer.GetPosition(trailerCrlf));
+                        break;
+                    }
+
+                    long? lfPos = FindByteOffset(buffer, (byte)'\n');
+                    if (lfPos.HasValue)
+                    {
+                        buffer = buffer.Slice(lfPos.Value + 1);
+                        reader.AdvanceTo(buffer.Start);
+                        continue;
+                    }
+
+                    if (isCompleted)
+                        break;
+
+                    reader.AdvanceTo(buffer.Start, buffer.End);
+                    var rr = await reader.ReadAsync(ct).ConfigureAwait(false);
+                    buffer = rr.Buffer;
+                    isCompleted = rr.IsCompleted;
+                }
+
+                request.Body = bodyWriter.WrittenMemory;
+                return BodyReadStatus.Ok;
+            }
+
+            int chunkInt = (int)chunkSize;
+            while (buffer.Length < chunkInt + 2)
+            {
+                if (isCompleted)
+                {
+                    if (buffer.Length < chunkInt + 1)
+                        return BodyReadStatus.BadRequest;
+                    break;
+                }
+
+                reader.AdvanceTo(buffer.Start, buffer.End);
+                var rr = await reader.ReadAsync(ct).ConfigureAwait(false);
+                buffer = rr.Buffer;
+                isCompleted = rr.IsCompleted;
+            }
+
+            Span<byte> dest = bodyWriter.GetSpan(chunkInt);
+            buffer.Slice(0, chunkInt).CopyTo(dest);
+            bodyWriter.Advance(chunkInt);
+            totalBytes += chunkInt;
+
+            buffer = buffer.Slice(chunkInt);
+            int crlfConsume = ConsumeLeadingCrlf(buffer);
+            if (crlfConsume == 0)
+                return BodyReadStatus.BadRequest;
+            buffer = buffer.Slice(crlfConsume);
+            reader.AdvanceTo(buffer.Start);
+        }
+    }
+
+    private static long? FindByteOffset(in ReadOnlySequence<byte> buffer, byte target)
+    {
+        long offset = 0;
+        foreach (ReadOnlyMemory<byte> seg in buffer)
+        {
+            int idx = seg.Span.IndexOf(target);
+            if (idx >= 0) return offset + idx;
+            offset += seg.Length;
+        }
+        return null;
+    }
+
+    private static int ConsumeLeadingCrlf(in ReadOnlySequence<byte> buffer)
+    {
+        if (buffer.IsEmpty) return 0;
+        Span<byte> head = stackalloc byte[2];
+        int copyLen = (int)Math.Min(buffer.Length, 2);
+        buffer.Slice(0, copyLen).CopyTo(head);
+        if (copyLen >= 2 && head[0] == (byte)'\r' && head[1] == (byte)'\n')
+            return 2;
+        if (head[0] == (byte)'\n')
+            return 1;
+        return 0;
+    }
+
+    private static bool TryParseChunkSizeLine(
+        in ReadOnlySequence<byte> buffer,
+        out long chunkSize,
+        out int lineEndFlag,
+        out int headerConsumed)
+    {
+        chunkSize = 0;
+        lineEndFlag = -1;
+        headerConsumed = 0;
+
+        if (buffer.IsEmpty) return false;
+
+        int scanLen = (int)Math.Min(buffer.Length, 128);
+        Span<byte> scratch = stackalloc byte[scanLen];
+        buffer.Slice(0, scanLen).CopyTo(scratch);
+
+        int crlf = HttpSimdParser.IndexOfCrlfVector256(scratch);
+        if (crlf < 0)
+        {
+            if (buffer.Length >= 128)
+            {
+                lineEndFlag = -2; // Malformed oversized chunk header line
+            }
+            return false;
+        }
+
+        int lineEndLen;
+        if (scratch[crlf] == (byte)'\r')
+        {
+            if (crlf + 1 >= scanLen)
+            {
+                // Wait for '\n' byte following '\r'
+                return false;
+            }
+            lineEndLen = scratch[crlf + 1] == (byte)'\n' ? 2 : 1;
+        }
+        else
+        {
+            lineEndLen = 1;
+        }
+
+        ReadOnlySpan<byte> hexLine = scratch[..crlf];
+        // Strip optional chunk extensions (;ext=val)
+        int semi = hexLine.IndexOf((byte)';');
+        if (semi >= 0) hexLine = hexLine[..semi];
+        hexLine = TrimAsciiWhitespace(hexLine);
+
+        if (hexLine.IsEmpty)
+        {
+            lineEndFlag = -2;
+            return false;
+        }
+
+        long parsed = 0;
+        for (int i = 0; i < hexLine.Length; i++)
+        {
+            byte b = hexLine[i];
+            int digit = b switch
+            {
+                >= (byte)'0' and <= (byte)'9' => b - '0',
+                >= (byte)'a' and <= (byte)'f' => 10 + (b - 'a'),
+                >= (byte)'A' and <= (byte)'F' => 10 + (b - 'A'),
+                _ => -1
+            };
+            if (digit < 0 || parsed > (long.MaxValue >> 4))
+            {
+                lineEndFlag = -2;
+                return false;
+            }
+            parsed = (parsed << 4) | (uint)digit;
+        }
+
+        chunkSize = parsed;
+        lineEndFlag = crlf;
+        headerConsumed = crlf + lineEndLen;
+        return true;
+    }
+
+    private static ReadOnlySpan<byte> TrimAsciiWhitespace(ReadOnlySpan<byte> span)
+    {
+        int start = 0;
+        while (start < span.Length && (span[start] == (byte)' ' || span[start] == (byte)'\t')) start++;
+        int end = span.Length - 1;
+        while (end >= start && (span[end] == (byte)' ' || span[end] == (byte)'\t')) end--;
+        return start <= end ? span.Slice(start, end - start + 1) : ReadOnlySpan<byte>.Empty;
     }
 
     internal static bool TryMatchRoute(IRouter router, HttpMethod method, string path, out RouteMatch match)
@@ -302,31 +556,62 @@ public sealed class GlacierServeApp : IDisposable
         }
     }
 
-    private static bool TryParseRequestHeaders(
+    private static bool TryParseRequestAndMatchRoute(
         in ReadOnlySequence<byte> buffer,
+        IRouter router,
         out HttpMethod method,
         out string path,
+        out string queryString,
         out Dictionary<string, string> headers,
+        out bool routeMatched,
+        out RouteMatch routeMatch,
         out int totalConsumed)
     {
-        int maxHeaderScan = (int)Math.Min(buffer.Length, 8192);
+        int maxHeaderScan = (int)Math.Min(buffer.Length, 16384);
         if (buffer.IsSingleSegment)
         {
-            return TryParseSpanHeaders(buffer.FirstSpan, out method, out path, out headers, out totalConsumed);
+            return TryParseSpanHeadersAndMatch(
+                buffer.FirstSpan,
+                router,
+                out method,
+                out path,
+                out queryString,
+                out headers,
+                out routeMatched,
+                out routeMatch,
+                out totalConsumed);
         }
 
         if (maxHeaderScan <= 4096)
         {
             Span<byte> scratch = stackalloc byte[maxHeaderScan];
             buffer.Slice(0, maxHeaderScan).CopyTo(scratch);
-            return TryParseSpanHeaders(scratch, out method, out path, out headers, out totalConsumed);
+            return TryParseSpanHeadersAndMatch(
+                scratch,
+                router,
+                out method,
+                out path,
+                out queryString,
+                out headers,
+                out routeMatched,
+                out routeMatch,
+                out totalConsumed);
         }
 
         byte[] rented = ArrayPool<byte>.Shared.Rent(maxHeaderScan);
         try
         {
             buffer.Slice(0, maxHeaderScan).CopyTo(rented);
-            return TryParseSpanHeaders(rented.AsSpan(0, maxHeaderScan), out method, out path, out headers, out totalConsumed);
+            return TryParseSpanHeadersAndMatch(
+                rented.AsSpan(0, maxHeaderScan),
+                router,
+                out method,
+                out path,
+                out queryString,
+                out headers,
+                out routeMatched,
+                out routeMatch,
+                out totalConsumed);
         }
         finally
         {
@@ -334,25 +619,52 @@ public sealed class GlacierServeApp : IDisposable
         }
     }
 
-    private static bool TryParseSpanHeaders(
+    private static bool TryParseSpanHeadersAndMatch(
         ReadOnlySpan<byte> span,
+        IRouter router,
         out HttpMethod method,
         out string path,
+        out string queryString,
         out Dictionary<string, string> headers,
+        out bool routeMatched,
+        out RouteMatch routeMatch,
         out int totalConsumed)
     {
         method = HttpMethod.Get;
         path = "/";
+        queryString = string.Empty;
         headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        routeMatched = false;
+        routeMatch = default;
         totalConsumed = 0;
 
-        if (!HttpSimdParser.TryParseRequestLine(span, out var methodSpan, out var pathSpan, out int reqLineConsumed))
+        if (!HttpSimdParser.TryParseRequestLine(span, out var methodSpan, out var targetSpan, out int reqLineConsumed))
         {
             return false;
         }
 
         method = HttpSimdParser.ParseMethod(methodSpan);
-        path = Encoding.UTF8.GetString(pathSpan);
+
+        int qIdx = targetSpan.IndexOf((byte)'?');
+        ReadOnlySpan<byte> rawPathSpan;
+        if (qIdx >= 0)
+        {
+            rawPathSpan = targetSpan[..qIdx];
+            queryString = Encoding.UTF8.GetString(targetSpan[qIdx..]);
+        }
+        else
+        {
+            rawPathSpan = targetSpan;
+        }
+
+        if (rawPathSpan.IsEmpty)
+        {
+            rawPathSpan = "/"u8;
+        }
+
+        path = Encoding.UTF8.GetString(rawPathSpan);
+        // Match directly over the raw UTF-8 path bytes without string -> UTF8 round-trip
+        routeMatched = router.TryMatch(method, rawPathSpan, out routeMatch);
 
         var headerSpan = span[reqLineConsumed..];
         totalConsumed = reqLineConsumed;

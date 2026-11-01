@@ -19,6 +19,8 @@ public static class MetricsEndpoint
                 Status = "ok",
                 Server = "Glacier.Serve",
                 Engine = "ContinuousBatchEngine",
+                Backend = engine.ActiveBackend,
+                GpuAccelerated = engine.IsGpuAccelerated,
                 PagedAttention = true,
                 ActiveBatches = engine.ActiveBatchSize,
                 WaitingQueue = engine.WaitingQueueLength,
