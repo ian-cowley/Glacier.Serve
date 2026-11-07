@@ -26,7 +26,21 @@ public sealed class BlockTable
     }
 
     /// <summary>
+    /// Attaches pre-allocated shared prefix blocks to this sequence's virtual page table.
+    /// </summary>
+    public void AttachPrefixBlocks(ReadOnlySpan<int> prefixBlockIds, int tokenCount)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(tokenCount, 0);
+        for (int i = 0; i < prefixBlockIds.Length; i++)
+        {
+            _physicalBlockIds.Add(prefixBlockIds[i]);
+        }
+        TokenCount = tokenCount;
+    }
+
+    /// <summary>
     /// Allocates physical slot for next token. If block boundary is crossed, allocates new physical block.
+    /// Enforces Copy-On-Write if the current block is shared.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool AppendToken(out int physicalBlockId, out int offsetInBlock)
@@ -40,6 +54,23 @@ public sealed class BlockTable
                 return false;
             }
             _physicalBlockIds.Add(newBlockId);
+        }
+        else
+        {
+            int lastBlockId = _physicalBlockIds[^1];
+            if (_pool.GetRefCount(lastBlockId) > 1)
+            {
+                // COW: Fork shared partial block
+                int tokensInBlock = TokenCount % BlockSize;
+                if (!_pool.TryForkBlock(lastBlockId, tokensInBlock, out int forkedBlockId))
+                {
+                    physicalBlockId = -1;
+                    offsetInBlock = -1;
+                    return false;
+                }
+                _pool.ReleaseBlock(lastBlockId);
+                _physicalBlockIds[^1] = forkedBlockId;
+            }
         }
 
         physicalBlockId = _physicalBlockIds[^1];
@@ -78,7 +109,7 @@ public sealed class BlockTable
     {
         for (int i = 0; i < _physicalBlockIds.Count; i++)
         {
-            _pool.FreeBlock(_physicalBlockIds[i]);
+            _pool.ReleaseBlock(_physicalBlockIds[i]);
         }
         _physicalBlockIds.Clear();
         TokenCount = 0;

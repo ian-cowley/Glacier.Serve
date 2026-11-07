@@ -8,7 +8,7 @@ using System.Text.Json;
 using System.Threading.Tasks;
 using Glacier.Polaris;
 using Glacier.Serve.Core;
-using Glacier.Storage.Arrow;
+using Glacier.Formats.Arrow;
 
 public static class DataFrameHttpExtensions
 {

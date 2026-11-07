@@ -10,7 +10,7 @@ using Glacier.Polaris;
 using Glacier.Polaris.Data;
 using Glacier.Serve.Core;
 using Glacier.Serve.Serialization;
-using Glacier.Storage.Arrow;
+using Glacier.Formats.Arrow;
 using Glacier.Tensor.Core;
 using Xunit;
 

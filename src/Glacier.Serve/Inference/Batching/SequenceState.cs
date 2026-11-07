@@ -22,6 +22,8 @@ public sealed class SequenceState
     public BlockTable BlockTable { get; }
     public int PrefilledTokens { get; set; }
     public int CurrentPos { get; set; }
+    public int BoundPrefixBlocks { get; set; }
+    public ulong LastPrefixHash { get; set; }
     public int LastToken { get; set; }
     public int MaxNewTokens { get; set; }
     public SamplingOptions SamplingOptions { get; }

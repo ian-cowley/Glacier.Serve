@@ -114,9 +114,10 @@ public sealed unsafe class CudaPagedTransformerRunner : IPagedModelRunner
             int vHeadDim = weights.ValueDim > 0 ? weights.ValueDim : headDim;
             int maxBlocksPerSeq = (maxSeqLen + blockSize - 1) / blockSize;
 
+            int effectiveMaxBatch = Math.Max(maxBatchSize, Qwen2GpuModel.MaxBatchSize);
             nuint poolBytesK = checked((nuint)((long)totalBlocks * layers * headsKv * blockSize * headDim * sizeof(ushort)));
             nuint poolBytesV = checked((nuint)((long)totalBlocks * layers * headsKv * blockSize * vHeadDim * sizeof(ushort)));
-            nuint blockTableBytes = checked((nuint)(Math.Max(1, maxBlocksPerSeq) * sizeof(int)));
+            nuint blockTableBytes = checked((nuint)((long)effectiveMaxBatch * Math.Max(1, maxBlocksPerSeq) * sizeof(int)));
 
             ulong estimatedModelBytes = EstimateModelVramBytes(weights);
             ulong requiredBytes = estimatedModelBytes + poolBytesK + poolBytesV + blockTableBytes + SafetyVramHeadroomBytes;
@@ -340,18 +341,20 @@ public sealed unsafe class CudaPagedTransformerRunner : IPagedModelRunner
             }
 
             successFlags[b] = true;
-            UploadBlockTable(blockTable);
+            UploadBlockTable(blockTable, b);
 
             Span<float> seqLogits = (computeLogits && !logitsBatch.IsEmpty)
                 ? logitsBatch.Slice(b * _vocabSize, _vocabSize)
                 : Span<float>.Empty;
+
+            IntPtr seqBlockTable = _dBlockTable + (b * _maxBlocksPerSeq * sizeof(int));
 
             _gpuModel.ForwardPagedToken(
                 tokens[b],
                 pos,
                 _dKPool,
                 _dVPool,
-                _dBlockTable,
+                seqBlockTable,
                 _blockSize,
                 seqLogits,
                 computeLogits && !seqLogits.IsEmpty);
@@ -361,16 +364,17 @@ public sealed unsafe class CudaPagedTransformerRunner : IPagedModelRunner
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void UploadBlockTable(BlockTable blockTable)
+    private void UploadBlockTable(BlockTable blockTable, int batchIndex = 0)
     {
         ReadOnlySpan<int> hostBlocks = blockTable.AsSpan();
         if (hostBlocks.IsEmpty) return;
         if (hostBlocks.Length > _maxBlocksPerSeq)
             throw new ArgumentOutOfRangeException(nameof(blockTable), hostBlocks.Length, $"Sequence block count {hostBlocks.Length} exceeds maxBlocksPerSeq {_maxBlocksPerSeq}.");
 
+        IntPtr targetDevicePtr = _dBlockTable + (batchIndex * _maxBlocksPerSeq * sizeof(int));
         fixed (int* pBlocks = hostBlocks)
         {
-            _gpu.CopyToDevice(_dBlockTable, (IntPtr)pBlocks, (nuint)(hostBlocks.Length * sizeof(int)));
+            _gpu.CopyToDevice(targetDevicePtr, (IntPtr)pBlocks, (nuint)(hostBlocks.Length * sizeof(int)));
         }
     }
 

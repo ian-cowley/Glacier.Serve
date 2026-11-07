@@ -53,3 +53,8 @@ appsettings*.json
 *.pem
 secrets*.json
 
+
+bin/
+obj/
+*.tmp
+!.env.example

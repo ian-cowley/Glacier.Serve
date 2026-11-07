@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -37,6 +38,9 @@ public sealed unsafe class PagedBlockPool : IDisposable
     private readonly bool _allocateHostBuffers;
     private readonly ConcurrentStack<int> _freeBlocks;
     private readonly int[] _blockAllocatedState;
+    private readonly int[] _refCounts;
+    private readonly ulong[] _blockPrefixHashes;
+    private readonly ConcurrentDictionary<ulong, int> _prefixHashMap;
     private bool _disposed;
 
     public int TotalBlocks => _totalBlocks;
@@ -106,6 +110,9 @@ public sealed unsafe class PagedBlockPool : IDisposable
         }
 
         _blockAllocatedState = new int[_totalBlocks];
+        _refCounts = new int[_totalBlocks];
+        _blockPrefixHashes = new ulong[_totalBlocks];
+        _prefixHashMap = new ConcurrentDictionary<ulong, int>();
         _freeBlocks = new ConcurrentStack<int>();
         for (int i = _totalBlocks - 1; i >= 0; i--)
         {
@@ -154,6 +161,17 @@ public sealed unsafe class PagedBlockPool : IDisposable
     }
 
     /// <summary>
+    /// Computes the 64-bit xxHash3 cumulative Merkle prefix hash over a block of token IDs.
+    /// Uses the predecessor block's cumulative hash as seed.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static ulong ComputePrefixHash(ulong parentHash, ReadOnlySpan<int> tokens)
+    {
+        ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(tokens);
+        return System.IO.Hashing.XxHash3.HashToUInt64(bytes, (long)parentHash);
+    }
+
+    /// <summary>
     /// Attempts to allocate a physical block from the free list in O(1).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -162,10 +180,112 @@ public sealed unsafe class PagedBlockPool : IDisposable
         if (_freeBlocks.TryPop(out physicalBlockId))
         {
             Interlocked.Exchange(ref _blockAllocatedState[physicalBlockId], 1);
+            Interlocked.Exchange(ref _refCounts[physicalBlockId], 1);
+            Volatile.Write(ref _blockPrefixHashes[physicalBlockId], 0UL);
             return true;
         }
         physicalBlockId = -1;
         return false;
+    }
+
+    /// <summary>
+    /// Atomically searches for a cached block matching prefixHash and increments its ref-count if found.
+    /// </summary>
+    public bool TryFindPrefixBlock(ulong prefixHash, out int physicalBlockId)
+    {
+        if (prefixHash != 0UL && _prefixHashMap.TryGetValue(prefixHash, out physicalBlockId))
+        {
+            while (true)
+            {
+                int current = Volatile.Read(ref _refCounts[physicalBlockId]);
+                if (current <= 0)
+                {
+                    physicalBlockId = -1;
+                    return false;
+                }
+                if (Interlocked.CompareExchange(ref _refCounts[physicalBlockId], current + 1, current) == current)
+                {
+                    if (Volatile.Read(ref _blockPrefixHashes[physicalBlockId]) != prefixHash)
+                    {
+                        ReleaseBlock(physicalBlockId);
+                        physicalBlockId = -1;
+                        return false;
+                    }
+                    return true;
+                }
+            }
+        }
+        physicalBlockId = -1;
+        return false;
+    }
+
+    /// <summary>
+    /// Registers a full block's cumulative prefix hash in the cache.
+    /// </summary>
+    public void BindPrefixBlock(ulong prefixHash, int physicalBlockId)
+    {
+        if ((uint)physicalBlockId >= (uint)_totalBlocks)
+            throw new ArgumentOutOfRangeException(nameof(physicalBlockId));
+        if (prefixHash == 0UL)
+            throw new ArgumentException("Prefix hash cannot be 0.", nameof(prefixHash));
+
+        Volatile.Write(ref _blockPrefixHashes[physicalBlockId], prefixHash);
+        _prefixHashMap[prefixHash] = physicalBlockId;
+    }
+
+    /// <summary>
+    /// Increments atomic reference count for physical block.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public int RetainBlock(int physicalBlockId)
+    {
+        if ((uint)physicalBlockId >= (uint)_totalBlocks)
+            throw new ArgumentOutOfRangeException(nameof(physicalBlockId));
+        return Interlocked.Increment(ref _refCounts[physicalBlockId]);
+    }
+
+    /// <summary>
+    /// Decrements atomic reference count. Recycles block to free pool when ref-count reaches 0.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public int ReleaseBlock(int physicalBlockId)
+    {
+        if ((uint)physicalBlockId >= (uint)_totalBlocks)
+            return 0;
+
+        int remaining = Interlocked.Decrement(ref _refCounts[physicalBlockId]);
+        if (remaining < 0)
+        {
+            Interlocked.Exchange(ref _refCounts[physicalBlockId], 0);
+            return 0;
+        }
+
+        if (remaining == 0)
+        {
+            ulong hash = Volatile.Read(ref _blockPrefixHashes[physicalBlockId]);
+            if (hash != 0UL)
+            {
+                _prefixHashMap.TryRemove(new KeyValuePair<ulong, int>(hash, physicalBlockId));
+                Volatile.Write(ref _blockPrefixHashes[physicalBlockId], 0UL);
+            }
+
+            if (Interlocked.CompareExchange(ref _blockAllocatedState[physicalBlockId], 0, 1) == 1)
+            {
+                _freeBlocks.Push(physicalBlockId);
+            }
+        }
+
+        return remaining;
+    }
+
+    /// <summary>
+    /// Returns current atomic reference count for inspection.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public int GetRefCount(int physicalBlockId)
+    {
+        if ((uint)physicalBlockId >= (uint)_totalBlocks) return 0;
+        return Volatile.Read(ref _refCounts[physicalBlockId]);
     }
 
     /// <summary>
@@ -175,11 +295,50 @@ public sealed unsafe class PagedBlockPool : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void FreeBlock(int physicalBlockId)
     {
-        if ((uint)physicalBlockId < (uint)_totalBlocks &&
-            Interlocked.CompareExchange(ref _blockAllocatedState[physicalBlockId], 0, 1) == 1)
+        ReleaseBlock(physicalBlockId);
+    }
+
+    /// <summary>
+    /// Duplicates KV data up to validTokens from srcBlockId to dstBlockId for Copy-on-Write.
+    /// </summary>
+    public void CopyBlockData(int srcBlockId, int dstBlockId, int validTokens)
+    {
+        if (!_allocateHostBuffers)
+            throw new InvalidOperationException("Host KV buffers were omitted.");
+        if (validTokens <= 0) return;
+        int count = Math.Min(validTokens, _blockSize);
+
+        for (int l = 0; l < _layers; l++)
         {
-            _freeBlocks.Push(physicalBlockId);
+            for (int h = 0; h < _headsKv; h++)
+            {
+                for (int t = 0; t < count; t++)
+                {
+                    float* srcK = GetKeyPtr(srcBlockId, l, h, t);
+                    float* dstK = GetKeyPtr(dstBlockId, l, h, t);
+                    Buffer.MemoryCopy(srcK, dstK, _headDim * sizeof(float), _headDim * sizeof(float));
+
+                    float* srcV = GetValuePtr(srcBlockId, l, h, t);
+                    float* dstV = GetValuePtr(dstBlockId, l, h, t);
+                    Buffer.MemoryCopy(srcV, dstV, _vHeadDim * sizeof(float), _vHeadDim * sizeof(float));
+                }
+            }
         }
+    }
+
+    /// <summary>
+    /// Allocates a new block and copies valid token KV data for Copy-On-Write isolation.
+    /// </summary>
+    public bool TryForkBlock(int srcBlockId, int validTokens, out int forkedBlockId)
+    {
+        if (!TryAllocateBlock(out forkedBlockId))
+            return false;
+
+        if (_allocateHostBuffers)
+        {
+            CopyBlockData(srcBlockId, forkedBlockId, validTokens);
+        }
+        return true;
     }
 
     /// <summary>

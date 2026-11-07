@@ -185,6 +185,49 @@ public sealed class ContinuousBatchEngine : IDisposable
 
         string reqId = $"req-{Guid.NewGuid():N}";
         var blockTable = new BlockTable(_pool);
+        int blockSize = _pool.BlockSize;
+        int fullBlocks = promptTokens.Length / blockSize;
+        int matchedBlocks = 0;
+        ulong runningHash = 0UL;
+        Span<int> matchedBlockIds = stackalloc int[Math.Min(fullBlocks, 128)];
+        List<int>? dynamicMatched = null;
+
+        for (int b = 0; b < fullBlocks; b++)
+        {
+            ReadOnlySpan<int> blockTokens = promptTokens.AsSpan(b * blockSize, blockSize);
+            ulong blockHash = PagedBlockPool.ComputePrefixHash(runningHash, blockTokens);
+            if (_pool.TryFindPrefixBlock(blockHash, out int pBlockId))
+            {
+                runningHash = blockHash;
+                if (matchedBlocks < matchedBlockIds.Length)
+                {
+                    matchedBlockIds[matchedBlocks] = pBlockId;
+                }
+                else
+                {
+                    dynamicMatched ??= new List<int>(matchedBlockIds.ToArray());
+                    dynamicMatched.Add(pBlockId);
+                }
+                matchedBlocks++;
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        if (matchedBlocks > 0)
+        {
+            if (dynamicMatched != null)
+            {
+                blockTable.AttachPrefixBlocks(CollectionsMarshal.AsSpan(dynamicMatched), matchedBlocks * blockSize);
+            }
+            else
+            {
+                blockTable.AttachPrefixBlocks(matchedBlockIds.Slice(0, matchedBlocks), matchedBlocks * blockSize);
+            }
+        }
+
         var state = new SequenceState(
             requestId: reqId,
             promptTokens: promptTokens,
@@ -196,7 +239,13 @@ public sealed class ContinuousBatchEngine : IDisposable
             repetitionPenalty: repPenalty,
             topK: request.EffectiveTopK,
             seed: request.EffectiveSeed,
-            cancellationToken: ct);
+            cancellationToken: ct)
+        {
+            PrefilledTokens = matchedBlocks * blockSize,
+            CurrentPos = matchedBlocks * blockSize,
+            BoundPrefixBlocks = matchedBlocks,
+            LastPrefixHash = runningHash
+        };
 
         if (_tokenizer.TryGetTokenId("<think>", out int thinkId))
             state.SamplingOptions.ThinkTokenId = thinkId;
@@ -438,6 +487,49 @@ public sealed class ContinuousBatchEngine : IDisposable
 
         int promptLen = seq.PromptTokens.Length;
         int startPos = seq.PrefilledTokens;
+        int blockSize = _pool.BlockSize;
+
+        if (startPos >= promptLen)
+        {
+            // Fully cached prefix: evaluate final token to obtain logits for first token sampling
+            bool tokenOk = _runner.ForwardToken(
+                seq.PromptTokens[promptLen - 1],
+                promptLen - 1,
+                seq.BlockTable,
+                _pool,
+                logitsBuffer.AsSpan(),
+                computeLogits: true);
+
+            if (!tokenOk)
+            {
+                seq.IsFinished = true;
+                seq.FinishReason = "pool_oom";
+                CompleteAndRecycleSequence(seq);
+                _prefillingBatch.RemoveAt(0);
+                return;
+            }
+
+            _prefillingBatch.RemoveAt(0);
+            seq.IsPrefillDone = true;
+
+            if (seq.CancellationToken.IsCancellationRequested)
+            {
+                CancelAndRecycleSequence(seq);
+                return;
+            }
+
+            ProcessSampledToken(seq, logitsBuffer.AsSpan(), isFirstToken: true);
+            if (seq.IsFinished)
+            {
+                CompleteAndRecycleSequence(seq);
+            }
+            else
+            {
+                _activeBatch.Add(seq);
+            }
+            return;
+        }
+
         int chunkLen = Math.Min(promptLen - startPos, _prefillChunkSize);
         bool isFinalChunk = (startPos + chunkLen == promptLen);
 
@@ -460,6 +552,18 @@ public sealed class ContinuousBatchEngine : IDisposable
 
         seq.PrefilledTokens += chunkLen;
         seq.CurrentPos = seq.PrefilledTokens;
+
+        // Bind any newly completed full blocks into the prefix hash cache
+        int completedBlocks = seq.PrefilledTokens / blockSize;
+        while (seq.BoundPrefixBlocks < completedBlocks)
+        {
+            int blockIdx = seq.BoundPrefixBlocks;
+            ReadOnlySpan<int> blockTokens = seq.PromptTokens.AsSpan(blockIdx * blockSize, blockSize);
+            seq.LastPrefixHash = PagedBlockPool.ComputePrefixHash(seq.LastPrefixHash, blockTokens);
+            int physicalId = seq.BlockTable.GetBlockId(blockIdx);
+            _pool.BindPrefixBlock(seq.LastPrefixHash, physicalId);
+            seq.BoundPrefixBlocks++;
+        }
 
         if (!isFinalChunk)
         {
