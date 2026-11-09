@@ -124,6 +124,16 @@ dotnet add package Glacier.Serve --version 1.2.0
 
 ---
 
+## 🆕 What's New in v1.4.0
+
+- **Autonomous Sleep Daemon (`AutonomousSleepDaemon`)** — Added continuous background lifecycle monitoring implementing Google Research's wake/sleep continual learning framework (arXiv:2606.03979):
+  - Request quiescence and idle-period tracking with configurable sleep initiation thresholds (`IdleTimeToTriggerSleep`, `TokensProcessedThreshold`).
+  - Automated offline biological consolidation: unlocks pre-allocated MoE expansion banks, filters high-quality dream trajectories via SIMD Levenshtein + Cosine metrics, executes Generalized Knowledge Distillation (GKD), and resets volatile fast memory tiers.
+  - Zero-downtime serving resumption with instant thread-safe state synchronization.
+- **Ecosystem Dependency Alignment**: Upgraded `Glacier.Inference` to `v1.5.0` (HOPE Continuum Memory) and `Glacier.Tune` to `v1.1.0` (Sleep Consolidation Pipeline).
+
+---
+
 ## 🆕 What's New in v1.2.0
 
 - **VRAM-Resident CUDA PagedAttention (`CudaPagedTransformerRunner`)** — Native FP16 GPU block-pool execution backed by `Qwen2GpuModel` SASS/PTX kernels with zero duplicate host KV allocation, plus automatic CPU SIMD (`PagedTransformerRunner`) fallback.

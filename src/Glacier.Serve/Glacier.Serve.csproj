@@ -12,16 +12,17 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Serve</PackageId>
-    <Version>1.3.0</Version>
+    <Version>1.4.0</Version>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
-    <Description>Ultra-low-latency, Native AOT web and LLM inference microservices engine for .NET 10. Features PagedAttention, Continuous Iteration Batching, SIMD HTTP delimiter scanning, zero-allocation Radix Tree routing, Glacier.Storage Arrow streaming, and direct Polaris/Tensor streaming.</Description>
+    <Description>Ultra-low-latency, Native AOT web and LLM inference microservices engine for .NET 10. Features PagedAttention, Continuous Iteration Batching, SIMD HTTP delimiter scanning, zero-allocation Radix Tree routing, Glacier.Storage Arrow streaming, direct Polaris/Tensor streaming, and Autonomous Sleep Consolidation Daemons.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/ian-cowley/Glacier.Serve</PackageProjectUrl>
     <RepositoryUrl>https://github.com/ian-cowley/Glacier.Serve.git</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageTags>http;web;api;vllm;ollama;paged-attention;continuous-batching;llm;inference;simd;radix-tree;arrow-ipc;storage;net10;aot;glacier</PackageTags>
+    <PackageTags>http;web;api;vllm;ollama;paged-attention;continuous-batching;llm;inference;simd;radix-tree;arrow-ipc;storage;net10;aot;glacier;continual-learning;sleep</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageReleaseNotes>v1.4.0: Introduces AutonomousSleepDaemon for autonomous wake-sleep consolidation life-cycle management (arXiv:2606.03979). Continuously tracks inference request quiescence, schedules sleep consolidation upon token idle thresholds, triggers offline MoE parameter expansion and GKD knowledge distillation, prunes volatile continuum memory buffers, and seamlessly transitions back to serving without downtime. Updates Glacier.Inference to v1.5.0 and Glacier.Tune to v1.1.0.</PackageReleaseNotes>
     <IsAotCompatible>true</IsAotCompatible>
     <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
@@ -36,7 +37,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Glacier.Tensor" Version="1.0.9" />
+    <PackageReference Include="Glacier.Tensor" Version="1.1.0" />
     <PackageReference Include="System.IO.Hashing" Version="10.0.12" />
     <PackageReference Include="System.Security.Cryptography.Pkcs" Version="10.0.14" />
   </ItemGroup>
@@ -45,10 +46,12 @@
     <ProjectReference Include="../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj" />
     <ProjectReference Include="../../../Glacier.Polaris/src/Glacier.Polaris/Glacier.Polaris.csproj" />
     <ProjectReference Include="../../../Glacier.Inference/src/Glacier.Inference/Glacier.Inference.csproj" />
+    <ProjectReference Include="../../../Glacier.Tune/src/Glacier.Tune/Glacier.Tune.csproj" Condition="Exists('../../../Glacier.Tune/src/Glacier.Tune/Glacier.Tune.csproj')" />
   </ItemGroup>
   <ItemGroup Condition="!Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') or '$(UseLocalProjectReferences)' == 'false'">
     <PackageReference Include="Glacier.Formats" Version="1.0.0" />
     <PackageReference Include="Glacier.Polaris" Version="1.2.0" />
-    <PackageReference Include="Glacier.Inference" Version="1.4.0" />
+    <PackageReference Include="Glacier.Inference" Version="1.5.0" />
+    <PackageReference Include="Glacier.Tune" Version="1.1.0" />
   </ItemGroup>
 </Project>
