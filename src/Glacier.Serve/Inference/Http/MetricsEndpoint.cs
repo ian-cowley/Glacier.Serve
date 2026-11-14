@@ -27,7 +27,9 @@ public static class MetricsEndpoint
                 FreeKvBlocks = engine.BlockPool.FreeBlocksCount,
                 TotalKvBlocks = engine.BlockPool.TotalBlocks,
                 TokensGenerated = engine.TotalTokensGenerated,
-                ThroughputTokS = engine.ThroughputTokensPerSec
+                ThroughputTokS = engine.ThroughputTokensPerSec,
+                SleepState = engine.SleepDaemon?.CurrentState.ToString(),
+                PendingDreams = engine.SleepDaemon?.PendingDreamCount
             };
             await ctx.Response.WriteJsonAsync(health, Glacier.Serve.Serialization.ServeJsonContext.Default.HealthCheckResponse);
         });
@@ -55,8 +57,80 @@ public static class MetricsEndpoint
             sb.AppendLine("# TYPE glacier_step_latency_ms gauge");
             sb.AppendLine($"glacier_step_latency_ms {engine.LastIterationMs:F2}");
 
+            if (engine.SleepDaemon is { } sleepDaemon)
+            {
+                sb.AppendLine("# HELP glacier_sleep_state Sleep lifecycle state (0=Awake, 1=EnteringSleep, 2=Sleeping, 3=Waking)");
+                sb.AppendLine("# TYPE glacier_sleep_state gauge");
+                sb.AppendLine($"glacier_sleep_state {(int)sleepDaemon.CurrentState}");
+
+                sb.AppendLine("# HELP glacier_sleep_cycles_total Completed autonomous sleep consolidation cycles");
+                sb.AppendLine("# TYPE glacier_sleep_cycles_total counter");
+                sb.AppendLine($"glacier_sleep_cycles_total {sleepDaemon.CompletedSleepCycles}");
+
+                sb.AppendLine("# HELP glacier_sleep_dreams_consolidated_total Total dream candidates consolidated into MoE expansion slots");
+                sb.AppendLine("# TYPE glacier_sleep_dreams_consolidated_total counter");
+                sb.AppendLine($"glacier_sleep_dreams_consolidated_total {sleepDaemon.TotalDreamsConsolidated}");
+
+                sb.AppendLine("# HELP glacier_sleep_pending_dreams Queued dream candidates awaiting sleep consolidation");
+                sb.AppendLine("# TYPE glacier_sleep_pending_dreams gauge");
+                sb.AppendLine($"glacier_sleep_pending_dreams {sleepDaemon.PendingDreamCount}");
+            }
+
             ctx.Response.ContentType = "text/plain; version=0.0.4; charset=utf-8";
             await ctx.Response.WriteUtf8Async(sb.ToString());
+        });
+
+        app.MapGet("/v1/sleep/status", async ctx =>
+        {
+            var daemon = engine.SleepDaemon;
+            var status = new Glacier.Serve.Serialization.SleepStatusResponse
+            {
+                Enabled = daemon != null,
+                State = daemon != null ? daemon.CurrentState.ToString() : "Disabled",
+                CompletedCycles = daemon?.CompletedSleepCycles ?? 0,
+                TotalDreamsConsolidated = daemon?.TotalDreamsConsolidated ?? 0,
+                PendingDreams = daemon?.PendingDreamCount ?? 0
+            };
+            await ctx.Response.WriteJsonAsync(status, Glacier.Serve.Serialization.ServeJsonContext.Default.SleepStatusResponse);
+        });
+
+        app.MapPost("/v1/sleep/trigger", async ctx =>
+        {
+            var daemon = engine.SleepDaemon;
+            if (daemon == null)
+            {
+                await ctx.Response.WriteJsonAsync(
+                    new Glacier.Serve.Serialization.SleepTriggerResponse { Triggered = false, State = "Disabled" },
+                    Glacier.Serve.Serialization.ServeJsonContext.Default.SleepTriggerResponse);
+                return;
+            }
+
+            int dim = Math.Max(4, engine.SleepVectorDimension);
+            float[] centroid = new float[dim];
+            float invSqrt = 1.0f / MathF.Sqrt(dim);
+            Array.Fill(centroid, invSqrt);
+
+            var result = await daemon.TriggerImmediateSleepAsync(centroid, ctx.RequestAborted);
+            var response = result == null
+                ? new Glacier.Serve.Serialization.SleepTriggerResponse
+                {
+                    Triggered = false,
+                    State = daemon.CurrentState.ToString()
+                }
+                : new Glacier.Serve.Serialization.SleepTriggerResponse
+                {
+                    Triggered = true,
+                    State = daemon.CurrentState.ToString(),
+                    ExpertSlotIndex = result.ExpertSlotIndex,
+                    TotalDreams = result.TotalDreamsGenerated,
+                    AcceptedDreams = result.TotalDreamsAccepted,
+                    AcceptanceRate = result.AcceptanceRate,
+                    InitialLoss = result.InitialGkdLoss,
+                    FinalLoss = result.FinalGkdLoss,
+                    SynapticPruningSucceeded = result.SynapticPruningSucceeded
+                };
+
+            await ctx.Response.WriteJsonAsync(response, Glacier.Serve.Serialization.ServeJsonContext.Default.SleepTriggerResponse);
         });
     }
 

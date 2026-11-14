@@ -117,6 +117,30 @@ public sealed class HealthCheckResponse
     [JsonPropertyName("total_kv_blocks")] public int TotalKvBlocks { get; set; }
     [JsonPropertyName("tokens_generated")] public long TokensGenerated { get; set; }
     [JsonPropertyName("throughput_tok_s")] public double ThroughputTokS { get; set; }
+    [JsonPropertyName("sleep_state")] public string? SleepState { get; set; }
+    [JsonPropertyName("pending_dreams")] public int? PendingDreams { get; set; }
+}
+
+public sealed class SleepStatusResponse
+{
+    [JsonPropertyName("enabled")] public bool Enabled { get; set; }
+    [JsonPropertyName("state")] public string State { get; set; } = "Disabled";
+    [JsonPropertyName("completed_cycles")] public int CompletedCycles { get; set; }
+    [JsonPropertyName("total_dreams_consolidated")] public int TotalDreamsConsolidated { get; set; }
+    [JsonPropertyName("pending_dreams")] public int PendingDreams { get; set; }
+}
+
+public sealed class SleepTriggerResponse
+{
+    [JsonPropertyName("triggered")] public bool Triggered { get; set; }
+    [JsonPropertyName("state")] public string State { get; set; } = "Disabled";
+    [JsonPropertyName("expert_slot_index")] public int? ExpertSlotIndex { get; set; }
+    [JsonPropertyName("total_dreams")] public int TotalDreams { get; set; }
+    [JsonPropertyName("accepted_dreams")] public int AcceptedDreams { get; set; }
+    [JsonPropertyName("acceptance_rate")] public float AcceptanceRate { get; set; }
+    [JsonPropertyName("initial_loss")] public float InitialLoss { get; set; }
+    [JsonPropertyName("final_loss")] public float FinalLoss { get; set; }
+    [JsonPropertyName("synaptic_pruning_succeeded")] public bool SynapticPruningSucceeded { get; set; }
 }
 
 public sealed class TensorDto
@@ -150,6 +174,8 @@ public sealed class TensorDto
 [JsonSerializable(typeof(OllamaModelItem))]
 [JsonSerializable(typeof(TensorDto))]
 [JsonSerializable(typeof(HealthCheckResponse))]
+[JsonSerializable(typeof(SleepStatusResponse))]
+[JsonSerializable(typeof(SleepTriggerResponse))]
 public partial class ServeJsonContext : JsonSerializerContext
 {
 }

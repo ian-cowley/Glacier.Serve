@@ -12,8 +12,10 @@ using Glacier.Inference.Gguf;
 using Glacier.Inference.Model;
 using Glacier.Inference.Sampling;
 using Glacier.Inference.Tokenizer;
+using Glacier.Serve.Daemons;
 using Glacier.Serve.Diagnostics;
 using Glacier.Serve.Inference.PagedAttention;
+using Glacier.Tune.Sleep;
 
 namespace Glacier.Serve.Inference.Batching;
 
@@ -55,7 +57,20 @@ public sealed class ContinuousBatchEngine : IDisposable
     private long _totalRequestsServed;
     private double _lastIterationMs;
     private volatile Exception? _faultException;
+    private AutonomousSleepDaemon? _sleepDaemon;
+    private int _sleepVectorDimension = 64;
     private bool _disposed;
+
+    public AutonomousSleepDaemon? SleepDaemon => _sleepDaemon;
+    public int SleepVectorDimension => _sleepVectorDimension;
+
+    public void AttachSleepDaemon(AutonomousSleepDaemon daemon, int vectorDimension = 64)
+    {
+        ArgumentNullException.ThrowIfNull(daemon);
+        if (vectorDimension <= 0) throw new ArgumentOutOfRangeException(nameof(vectorDimension));
+        _sleepDaemon = daemon;
+        _sleepVectorDimension = vectorDimension;
+    }
 
     public string ModelArchitecture => _gguf.Architecture;
     public int Layers => _weights.BlockCount;
@@ -271,6 +286,7 @@ public sealed class ContinuousBatchEngine : IDisposable
         }
 
         Interlocked.Increment(ref _waitingCount);
+        _sleepDaemon?.RecordActivity();
         try
         {
             await _waitingQueue.Writer.WriteAsync(state, ct);
@@ -340,12 +356,14 @@ public sealed class ContinuousBatchEngine : IDisposable
                 // 3. Decode Step across all active decoding sequences FIRST so ongoing streams never stall behind prefill
                 if (_activeBatch.Count > 0)
                 {
+                    _sleepDaemon?.RecordActivity();
                     ExecuteDecodeStep(batchTokens, batchPositions, successFlags, blockTables);
                 }
 
                 // 4. Non-Blocking Chunked Batched Prefill Step (at most _prefillChunkSize tokens per tick)
                 if (_prefillingBatch.Count > 0)
                 {
+                    _sleepDaemon?.RecordActivity();
                     ExecutePrefillChunkStep(prefillLogits);
                 }
 
@@ -839,8 +857,55 @@ public sealed class ContinuousBatchEngine : IDisposable
     {
         seq.BlockTable.ReleaseAll();
         seq.TokenChannel.Writer.TryComplete();
-        seq.Completion.TrySetResult(seq.GeneratedTextBuilder.ToString());
+        string completedText = seq.GeneratedTextBuilder.ToString();
+        seq.Completion.TrySetResult(completedText);
         Interlocked.Increment(ref _totalRequestsServed);
+
+        var sleepDaemon = _sleepDaemon;
+        if (sleepDaemon != null && seq.FinishReason == "stop" && !string.IsNullOrWhiteSpace(completedText))
+        {
+            int dim = _sleepVectorDimension;
+            float[] queryVec = BuildTokenFeatureVector(seq.PromptTokens, dim);
+            float[] targetVec = BuildTokenFeatureVector(seq.GeneratedTokens, dim);
+            sleepDaemon.QueueDream(new DreamCandidate(
+                PromptPrefix: seq.RequestId,
+                GeneratedDream: completedText,
+                QueryVector: queryVec,
+                TargetTeacherOutput: targetVec,
+                SemanticSimilarity: 1.0f,
+                LevenshteinRatio: 1.0f,
+                CompositeScore: 0.90f));
+        }
+    }
+
+    private static float[] BuildTokenFeatureVector(IReadOnlyList<int> tokens, int dimension)
+    {
+        float[] vec = new float[dimension];
+        if (tokens.Count == 0)
+        {
+            vec[0] = 1.0f;
+            return vec;
+        }
+
+        for (int i = 0; i < tokens.Count; i++)
+        {
+            uint h = (uint)tokens[i] * 2654435761u;
+            int idx = (int)(h % (uint)dimension);
+            vec[idx] += ((h & 1u) == 0u) ? 1.0f : -1.0f;
+        }
+
+        float normSq = 0f;
+        for (int i = 0; i < dimension; i++) normSq += vec[i] * vec[i];
+        if (normSq > 0f)
+        {
+            float invNorm = 1.0f / MathF.Sqrt(normSq);
+            for (int i = 0; i < dimension; i++) vec[i] *= invNorm;
+        }
+        else
+        {
+            vec[0] = 1.0f;
+        }
+        return vec;
     }
 
     private static string[]? NormalizeStopSequences(string[]? stops)

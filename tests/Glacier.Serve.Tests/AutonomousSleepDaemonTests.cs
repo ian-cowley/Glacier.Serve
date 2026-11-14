@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using Glacier.Serve.Daemons;
+using Glacier.Serve.Inference.Batching;
 using Glacier.Tune.Expansion;
 using Glacier.Tune.Sleep;
 using Xunit;
@@ -313,5 +314,84 @@ public class AutonomousSleepDaemonTests
             basis[i] = v;
         }
         return basis;
+    }
+
+    [Fact]
+    public async Task ContinuousBatchEngine_WithAttachedSleepDaemon_ExposesStatusAndTriggerEndpoints()
+    {
+        string ggufPath = System.IO.Path.Combine(
+            System.IO.Path.GetTempPath(),
+            $"sleep_e2e_{Guid.NewGuid():N}.gguf");
+        try
+        {
+            PhaseCServeRemediationTests.SyntheticGgufBuilder.WriteModel(
+                ggufPath,
+                includeThinkTokens: false,
+                useQ8Weights: false,
+                forcedTargetTokenIds: [PhaseCServeRemediationTests.SyntheticGgufBuilder.GetByteTokenId((byte)'A')]);
+
+            const int dim = 32;
+            using var bank = new PreallocatedMoeExpansionBank(dim, rank: 8, maxExperts: 2);
+            using var trainer = new SleepConsolidationTrainer(bank);
+            using var daemon = new AutonomousSleepDaemon(trainer, new SleepDaemonOptions(
+                IdleThreshold: TimeSpan.FromSeconds(60),
+                PollingInterval: TimeSpan.FromMilliseconds(50),
+                DistillationSteps: 20));
+
+            using var engine = new ContinuousBatchEngine(
+                ggufPath,
+                totalKvBlocks: 16,
+                maxBatchSize: 4,
+                maxSeqLen: 64,
+                useGpu: false);
+            engine.AttachSleepDaemon(daemon, dim);
+
+            // Queue a synthetic dream directly and verify /v1/sleep/status + /v1/sleep/trigger
+            var rng = new Random(7);
+            float[] q = CreateRandomUnitVector(rng, dim);
+            float[] t = CreateRandomUnitVector(rng, dim);
+            daemon.QueueDream(new DreamCandidate("prefix", "dream", q, t, 1.0f, 1.0f, 0.9f));
+
+            using var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+            listener.Start();
+            int port = ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
+            listener.Stop();
+
+            using var app = Glacier.Serve.Server.GlacierServeApp.CreateBuilder()
+                .UseHost("127.0.0.1")
+                .UsePort(port)
+                .Build();
+            Glacier.Serve.Inference.Http.MetricsEndpoint.MapInference(app, engine, "test-model");
+            await app.StartAsync();
+
+            using var http = new System.Net.Http.HttpClient { BaseAddress = new Uri($"http://127.0.0.1:{port}") };
+            string statusJson = await http.GetStringAsync("/v1/sleep/status");
+            var status = System.Text.Json.JsonSerializer.Deserialize(
+                statusJson,
+                Glacier.Serve.Serialization.ServeJsonContext.Default.SleepStatusResponse);
+            Assert.NotNull(status);
+            Assert.True(status!.Enabled);
+            Assert.Equal("Awake", status.State);
+            Assert.Equal(1, status.PendingDreams);
+
+            using var triggerRes = await http.PostAsync("/v1/sleep/trigger", null);
+            triggerRes.EnsureSuccessStatusCode();
+            string triggerJson = await triggerRes.Content.ReadAsStringAsync();
+            var trigger = System.Text.Json.JsonSerializer.Deserialize(
+                triggerJson,
+                Glacier.Serve.Serialization.ServeJsonContext.Default.SleepTriggerResponse);
+            Assert.NotNull(trigger);
+            Assert.True(trigger!.Triggered);
+            Assert.Equal(1, trigger.AcceptedDreams);
+            Assert.Equal("Awake", trigger.State);
+
+            string metricsText = await http.GetStringAsync("/metrics");
+            Assert.Contains("glacier_sleep_cycles_total 1", metricsText);
+            Assert.Contains("glacier_sleep_dreams_consolidated_total 1", metricsText);
+        }
+        finally
+        {
+            if (System.IO.File.Exists(ggufPath)) System.IO.File.Delete(ggufPath);
+        }
     }
 }

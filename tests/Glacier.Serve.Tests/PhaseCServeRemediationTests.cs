@@ -1190,7 +1190,7 @@ public sealed class PhaseCServeRemediationTests : IDisposable
         }
     }
 
-    private static class SyntheticGgufBuilder
+    internal static class SyntheticGgufBuilder
     {
         public const int BosTokenIdConst = 256;
         public const int EosTokenIdConst = 257;
