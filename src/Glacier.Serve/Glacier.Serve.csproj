@@ -12,7 +12,7 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Serve</PackageId>
-    <Version>1.5.0</Version>
+    <Version>1.6.0</Version>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
     <Description>Ultra-low-latency, Native AOT web and LLM inference microservices engine for .NET 10. Features PagedAttention, Continuous Iteration Batching, SIMD HTTP delimiter scanning, zero-allocation Radix Tree routing, Glacier.Storage Arrow streaming, direct Polaris/Tensor streaming, and Autonomous Sleep Consolidation Daemons.</Description>
@@ -51,7 +51,7 @@
   <ItemGroup Condition="!Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') or '$(UseLocalProjectReferences)' == 'false'">
     <PackageReference Include="Glacier.Formats" Version="1.0.0" />
     <PackageReference Include="Glacier.Polaris" Version="1.2.0" />
-    <PackageReference Include="Glacier.Inference" Version="1.6.0" />
-    <PackageReference Include="Glacier.Tune" Version="1.1.0" />
+    <PackageReference Include="Glacier.Inference" Version="1.7.0" />
+    <PackageReference Include="Glacier.Tune" Version="1.2.0" />
   </ItemGroup>
 </Project>

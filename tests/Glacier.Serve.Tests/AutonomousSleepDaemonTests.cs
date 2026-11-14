@@ -344,7 +344,8 @@ public class AutonomousSleepDaemonTests
                 maxBatchSize: 4,
                 maxSeqLen: 64,
                 useGpu: false);
-            engine.AttachSleepDaemon(daemon, dim);
+            engine.AttachSleepDaemon(daemon, dim, expansionRouter: bank);
+            Assert.Same(bank, engine.ExpansionRouter);
 
             // Queue a synthetic dream directly and verify /v1/sleep/status + /v1/sleep/trigger
             var rng = new Random(7);

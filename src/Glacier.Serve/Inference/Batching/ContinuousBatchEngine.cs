@@ -58,18 +58,37 @@ public sealed class ContinuousBatchEngine : IDisposable
     private double _lastIterationMs;
     private volatile Exception? _faultException;
     private AutonomousSleepDaemon? _sleepDaemon;
+    private ISleepExpansionRouter? _expansionRouter;
+    private float _expansionResidualScale = 1.0f;
     private int _sleepVectorDimension = 64;
     private bool _disposed;
 
     public AutonomousSleepDaemon? SleepDaemon => _sleepDaemon;
+    public ISleepExpansionRouter? ExpansionRouter => _expansionRouter;
     public int SleepVectorDimension => _sleepVectorDimension;
 
-    public void AttachSleepDaemon(AutonomousSleepDaemon daemon, int vectorDimension = 64)
+    public void AttachSleepDaemon(
+        AutonomousSleepDaemon daemon,
+        int vectorDimension = 64,
+        ISleepExpansionRouter? expansionRouter = null,
+        float expansionResidualScale = 1.0f)
     {
         ArgumentNullException.ThrowIfNull(daemon);
         if (vectorDimension <= 0) throw new ArgumentOutOfRangeException(nameof(vectorDimension));
         _sleepDaemon = daemon;
         _sleepVectorDimension = vectorDimension;
+        if (expansionRouter != null)
+        {
+            _expansionRouter = expansionRouter;
+            _expansionResidualScale = expansionResidualScale;
+        }
+    }
+
+    public void AttachSleepExpansionRouter(ISleepExpansionRouter router, float residualScale = 1.0f)
+    {
+        ArgumentNullException.ThrowIfNull(router);
+        _expansionRouter = router;
+        _expansionResidualScale = residualScale;
     }
 
     public string ModelArchitecture => _gguf.Architecture;
@@ -650,6 +669,7 @@ public sealed class ContinuousBatchEngine : IDisposable
 
         // Prevent duplicate DetectPeriodicReasoningLoop scan inside Sampler.Sample
         seq.SamplingOptions.EnableReasoningLoopGuard = false;
+        ApplySleepExpansionResidual(seqLogits);
         int nextToken;
         try
         {
@@ -851,6 +871,42 @@ public sealed class ContinuousBatchEngine : IDisposable
             seq.Completion.TrySetCanceled(seq.CancellationToken);
         else
             seq.Completion.TrySetCanceled();
+    }
+
+    private void ApplySleepExpansionResidual(Span<float> logits)
+    {
+        var router = _expansionRouter;
+        if (router == null || router.ActiveExpertCount <= 0)
+            return;
+
+        int dim = router.Dimension;
+        int rank = router.Rank;
+        if (dim <= 0 || rank <= 0 || logits.Length < dim)
+            return;
+
+        float[]? rentedDelta = null;
+        float[]? rentedRank = null;
+        Span<float> delta = dim <= 512
+            ? stackalloc float[dim]
+            : (rentedDelta = ArrayPool<float>.Shared.Rent(dim)).AsSpan(0, dim);
+        Span<float> rankScratch = rank <= 128
+            ? stackalloc float[rank]
+            : (rentedRank = ArrayPool<float>.Shared.Rent(rank)).AsSpan(0, rank);
+
+        try
+        {
+            router.ForwardDelta(logits[..dim], delta, rankScratch);
+            float scale = _expansionResidualScale;
+            for (int i = 0; i < dim; i++)
+            {
+                logits[i] += delta[i] * scale;
+            }
+        }
+        finally
+        {
+            if (rentedDelta != null) ArrayPool<float>.Shared.Return(rentedDelta);
+            if (rentedRank != null) ArrayPool<float>.Shared.Return(rentedRank);
+        }
     }
 
     private void CompleteAndRecycleSequence(SequenceState seq)
