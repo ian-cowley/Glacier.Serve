@@ -51,7 +51,7 @@
   <ItemGroup Condition="!Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') or '$(UseLocalProjectReferences)' == 'false'">
     <PackageReference Include="Glacier.Formats" Version="1.0.0" />
     <PackageReference Include="Glacier.Polaris" Version="1.2.0" />
-    <PackageReference Include="Glacier.Inference" Version="1.5.0" />
+    <PackageReference Include="Glacier.Inference" Version="1.6.0" />
     <PackageReference Include="Glacier.Tune" Version="1.1.0" />
   </ItemGroup>
 </Project>
