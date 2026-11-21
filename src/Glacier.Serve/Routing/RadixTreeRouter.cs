@@ -176,11 +176,13 @@ public sealed class RadixTreeRouter : IRouter
 
             if (lcp < childPrefix.Length)
             {
-                // Split existing edge at LCP
+                // Split existing edge at LCP.
+                // Replace child with splitNode in current BEFORE mutating child.Prefix,
+                // because AddOrReplaceStaticChild matches on Prefix[0] == childPrefix[0].
                 var splitNode = new RadixNode(childPrefix[..lcp].ToArray());
+                current.AddOrReplaceStaticChild(splitNode);
                 child.Prefix = childPrefix[lcp..].ToArray();
                 splitNode.AddOrReplaceStaticChild(child);
-                current.AddOrReplaceStaticChild(splitNode);
                 child = splitNode;
             }
 

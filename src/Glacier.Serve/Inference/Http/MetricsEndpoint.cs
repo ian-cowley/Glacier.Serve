@@ -140,4 +140,10 @@ public static class MetricsEndpoint
         OllamaEndpoints.MapOllamaEndpoints(app, engine, defaultModelName);
         MapMetricsEndpoints(app, engine);
     }
+
+    public static void MapInference(this GlacierServeApp app, ContinuousBatchEngine engine, string defaultModelName, Glacier.Serve.Daemons.SleepMemoryService? sleepMemory)
+    {
+        MapInference(app, engine, defaultModelName);
+        app.MapSleepMemory(sleepMemory);
+    }
 }

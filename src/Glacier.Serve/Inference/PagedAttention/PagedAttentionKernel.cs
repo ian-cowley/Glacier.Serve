@@ -2,6 +2,7 @@ using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Threading.Tasks;
+using Glacier.Inference.Memory;
 using Glacier.Inference.Quant;
 
 namespace Glacier.Serve.Inference.PagedAttention;
@@ -9,7 +10,9 @@ namespace Glacier.Serve.Inference.PagedAttention;
 /// <summary>
 /// Hardware-accelerated PagedAttention kernel.
 /// Computes Multi-Head and Grouped Query Attention (GQA) across non-contiguous physical
-/// memory blocks stored in PagedBlockPool, achieving zero memory copy overhead and vector efficiency.
+/// memory blocks stored in PagedBlockPool, supporting <see cref="KvCachePrecision.Fp32"/>,
+/// <see cref="KvCachePrecision.Fp16"/>, <see cref="KvCachePrecision.Fp8"/>,
+/// <see cref="KvCachePrecision.Q8_0"/>, and <see cref="KvCachePrecision.Q4_0"/>.
 /// </summary>
 public static unsafe class PagedAttentionKernel
 {
@@ -44,6 +47,30 @@ public static unsafe class PagedAttentionKernel
         int groupSize = nHeads / nHeadsKv;
         int blockSize = pool.BlockSize;
         int blockCount = (totalTokens + blockSize - 1) / blockSize;
+        KvCachePrecision precision = pool.Precision;
+
+        if (precision != KvCachePrecision.Fp32)
+        {
+            ComputeAttentionQuantized(
+                stageLayer,
+                qBase,
+                outBase,
+                blockTable,
+                pool,
+                precision,
+                nHeads,
+                groupSize,
+                headDim,
+                vHeadDim,
+                attnScale,
+                headScores,
+                maxSeqLen,
+                totalTokens,
+                blockSize,
+                blockCount,
+                sinkLogit);
+            return;
+        }
 
         Parallel.For(0, nHeads, h =>
         {
@@ -367,6 +394,171 @@ public static unsafe class PagedAttentionKernel
                         }
                     }
                 }
+            }
+        });
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void ComputeAttentionQuantized(
+        int stageLayer,
+        float* qBase,
+        float* outBase,
+        BlockTable blockTable,
+        PagedBlockPool pool,
+        KvCachePrecision precision,
+        int nHeads,
+        int groupSize,
+        int headDim,
+        int vHeadDim,
+        float attnScale,
+        float* headScores,
+        int maxSeqLen,
+        int totalTokens,
+        int blockSize,
+        int blockCount,
+        float? sinkLogit)
+    {
+        Parallel.For(0, nHeads, h =>
+        {
+            int hKv = h / groupSize;
+            float* qHead = qBase + h * headDim;
+            float* scores = headScores + (long)h * maxSeqLen;
+
+            // 1. Block-by-block Q * K^T dot products (precision switch hoisted outside block/token loops)
+            switch (precision)
+            {
+                case KvCachePrecision.Fp16:
+                    for (int b = 0; b < blockCount; b++)
+                    {
+                        int pBlockId = blockTable.GetBlockId(b);
+                        int baseTokenIdx = b * blockSize;
+                        int tokensInBlock = Math.Min(blockSize, totalTokens - baseTokenIdx);
+                        for (int t = 0; t < tokensInBlock; t++)
+                        {
+                            Half* kPast = (Half*)pool.GetKeySlotPtr(pBlockId, stageLayer, hKv, t);
+                            scores[baseTokenIdx + t] = QuantKernels.VecDotF16(kPast, qHead, headDim) * attnScale;
+                        }
+                    }
+                    break;
+
+                case KvCachePrecision.Fp8:
+                    for (int b = 0; b < blockCount; b++)
+                    {
+                        int pBlockId = blockTable.GetBlockId(b);
+                        int baseTokenIdx = b * blockSize;
+                        int tokensInBlock = Math.Min(blockSize, totalTokens - baseTokenIdx);
+                        for (int t = 0; t < tokensInBlock; t++)
+                        {
+                            byte* kPast = pool.GetKeySlotPtr(pBlockId, stageLayer, hKv, t);
+                            scores[baseTokenIdx + t] = QuantKernels.VecDotFp8E4M3(kPast, qHead, headDim) * attnScale;
+                        }
+                    }
+                    break;
+
+                case KvCachePrecision.Q8_0:
+                    for (int b = 0; b < blockCount; b++)
+                    {
+                        int pBlockId = blockTable.GetBlockId(b);
+                        int baseTokenIdx = b * blockSize;
+                        int tokensInBlock = Math.Min(blockSize, totalTokens - baseTokenIdx);
+                        for (int t = 0; t < tokensInBlock; t++)
+                        {
+                            BlockQ8_0* kPast = (BlockQ8_0*)pool.GetKeySlotPtr(pBlockId, stageLayer, hKv, t);
+                            scores[baseTokenIdx + t] = QuantKernels.VecDotQ8_0Any(kPast, qHead, headDim) * attnScale;
+                        }
+                    }
+                    break;
+
+                case KvCachePrecision.Q4_0:
+                    for (int b = 0; b < blockCount; b++)
+                    {
+                        int pBlockId = blockTable.GetBlockId(b);
+                        int baseTokenIdx = b * blockSize;
+                        int tokensInBlock = Math.Min(blockSize, totalTokens - baseTokenIdx);
+                        for (int t = 0; t < tokensInBlock; t++)
+                        {
+                            BlockQ4_0* kPast = (BlockQ4_0*)pool.GetKeySlotPtr(pBlockId, stageLayer, hKv, t);
+                            scores[baseTokenIdx + t] = QuantKernels.VecDotQ4_0Any(kPast, qHead, headDim) * attnScale;
+                        }
+                    }
+                    break;
+
+                default:
+                    throw new NotSupportedException($"Unsupported KV cache precision in PagedAttentionKernel: {precision}.");
+            }
+
+            // 2. Softmax over all valid tokens in the sequence
+            QuantKernels.Softmax(scores, totalTokens, sinkLogit);
+
+            // 3. Explicitly zero output head before AccumulateScaled* (+=)
+            float* outHead = outBase + h * vHeadDim;
+            new Span<float>(outHead, vHeadDim).Clear();
+
+            switch (precision)
+            {
+                case KvCachePrecision.Fp16:
+                    for (int b = 0; b < blockCount; b++)
+                    {
+                        int pBlockId = blockTable.GetBlockId(b);
+                        int baseTokenIdx = b * blockSize;
+                        int tokensInBlock = Math.Min(blockSize, totalTokens - baseTokenIdx);
+                        for (int t = 0; t < tokensInBlock; t++)
+                        {
+                            float w = scores[baseTokenIdx + t];
+                            if (w == 0f) continue;
+                            Half* vPast = (Half*)pool.GetValueSlotPtr(pBlockId, stageLayer, hKv, t);
+                            QuantKernels.AccumulateScaledF16(vPast, w, outHead, vHeadDim);
+                        }
+                    }
+                    break;
+
+                case KvCachePrecision.Fp8:
+                    for (int b = 0; b < blockCount; b++)
+                    {
+                        int pBlockId = blockTable.GetBlockId(b);
+                        int baseTokenIdx = b * blockSize;
+                        int tokensInBlock = Math.Min(blockSize, totalTokens - baseTokenIdx);
+                        for (int t = 0; t < tokensInBlock; t++)
+                        {
+                            float w = scores[baseTokenIdx + t];
+                            if (w == 0f) continue;
+                            byte* vPast = pool.GetValueSlotPtr(pBlockId, stageLayer, hKv, t);
+                            QuantKernels.AccumulateScaledFp8E4M3(vPast, w, outHead, vHeadDim);
+                        }
+                    }
+                    break;
+
+                case KvCachePrecision.Q8_0:
+                    for (int b = 0; b < blockCount; b++)
+                    {
+                        int pBlockId = blockTable.GetBlockId(b);
+                        int baseTokenIdx = b * blockSize;
+                        int tokensInBlock = Math.Min(blockSize, totalTokens - baseTokenIdx);
+                        for (int t = 0; t < tokensInBlock; t++)
+                        {
+                            float w = scores[baseTokenIdx + t];
+                            if (w == 0f) continue;
+                            BlockQ8_0* vPast = (BlockQ8_0*)pool.GetValueSlotPtr(pBlockId, stageLayer, hKv, t);
+                            QuantKernels.AccumulateScaledQ8_0(vPast, w, outHead, vHeadDim);
+                        }
+                    }
+                    break;
+
+                case KvCachePrecision.Q4_0:
+                    for (int b = 0; b < blockCount; b++)
+                    {
+                        int pBlockId = blockTable.GetBlockId(b);
+                        int baseTokenIdx = b * blockSize;
+                        int tokensInBlock = Math.Min(blockSize, totalTokens - baseTokenIdx);
+                        for (int t = 0; t < tokensInBlock; t++)
+                        {
+                            float w = scores[baseTokenIdx + t];
+                            if (w == 0f) continue;
+                            BlockQ4_0* vPast = (BlockQ4_0*)pool.GetValueSlotPtr(pBlockId, stageLayer, hKv, t);
+                            QuantKernels.AccumulateScaledQ4_0(vPast, w, outHead, vHeadDim);
+                        }
+                    }
+                    break;
             }
         });
     }

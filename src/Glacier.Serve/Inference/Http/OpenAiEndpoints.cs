@@ -36,16 +36,28 @@ public static class OpenAiEndpoints
                 (SequenceState state, IAsyncEnumerable<string> tokenStream) enqueued;
                 try
                 {
-                    enqueued = await engine.EnqueueAsync(req, requestCts.Token);
+                    enqueued = await engine.EnqueueAsync(req, defaultModelName, requestCts.Token);
                 }
                 catch (ArgumentOutOfRangeException ex)
                 {
                     await WriteBadRequestAsync(ctx.Response, ex.Message);
                     return;
                 }
+                catch (ArgumentException ex)
+                {
+                    await WriteBadRequestAsync(ctx.Response, ex.Message);
+                    return;
+                }
+                catch (KeyNotFoundException ex)
+                {
+                    await WriteNotFoundAsync(ctx.Response, ex.Message);
+                    return;
+                }
 
                 var (state, tokenStream) = enqueued;
-                string modelName = string.IsNullOrEmpty(req.Model) ? defaultModelName : req.Model;
+                string modelName = !string.IsNullOrEmpty(req.Model)
+                    ? req.Model
+                    : (!string.IsNullOrEmpty(state.LoraAdapterName) ? $"{defaultModelName}:{state.LoraAdapterName}" : defaultModelName);
 
                 if (req.Stream)
                 {
@@ -75,6 +87,19 @@ public static class OpenAiEndpoints
 
                     string finishReason = string.IsNullOrEmpty(state.FinishReason) ? "stop" : state.FinishReason;
                     WriteChatSseFinishChunk(ctx.Response.BodyWriter, state.RequestId, nowSec, modelName, finishReason);
+                    if (req.StreamOptions?.IncludeUsage == true)
+                    {
+                        int promptTokens = state.PromptTokens.Length;
+                        int completionTokens = state.GeneratedTokens.Count;
+                        WriteChatSseUsageChunk(
+                            ctx.Response.BodyWriter,
+                            state.RequestId,
+                            nowSec,
+                            modelName,
+                            promptTokens,
+                            completionTokens,
+                            promptTokens + completionTokens);
+                    }
                     WriteSseDone(ctx.Response.BodyWriter);
                     await ctx.Response.BodyWriter.FlushAsync(requestCts.Token);
                 }
@@ -135,16 +160,28 @@ public static class OpenAiEndpoints
                 (SequenceState state, IAsyncEnumerable<string> tokenStream) enqueued;
                 try
                 {
-                    enqueued = await engine.EnqueueAsync(req, requestCts.Token);
+                    enqueued = await engine.EnqueueAsync(req, defaultModelName, requestCts.Token);
                 }
                 catch (ArgumentOutOfRangeException ex)
                 {
                     await WriteBadRequestAsync(ctx.Response, ex.Message);
                     return;
                 }
+                catch (ArgumentException ex)
+                {
+                    await WriteBadRequestAsync(ctx.Response, ex.Message);
+                    return;
+                }
+                catch (KeyNotFoundException ex)
+                {
+                    await WriteNotFoundAsync(ctx.Response, ex.Message);
+                    return;
+                }
 
                 var (state, tokenStream) = enqueued;
-                string modelName = string.IsNullOrEmpty(req.Model) ? defaultModelName : req.Model;
+                string modelName = !string.IsNullOrEmpty(req.Model)
+                    ? req.Model
+                    : (!string.IsNullOrEmpty(state.LoraAdapterName) ? $"{defaultModelName}:{state.LoraAdapterName}" : defaultModelName);
 
                 if (req.Stream)
                 {
@@ -174,6 +211,19 @@ public static class OpenAiEndpoints
 
                     string finishReason = string.IsNullOrEmpty(state.FinishReason) ? "stop" : state.FinishReason;
                     WriteTextCompletionSseFinishChunk(ctx.Response.BodyWriter, state.RequestId, nowSec, modelName, finishReason);
+                    if (req.StreamOptions?.IncludeUsage == true)
+                    {
+                        int promptTokens = state.PromptTokens.Length;
+                        int completionTokens = state.GeneratedTokens.Count;
+                        WriteTextCompletionSseUsageChunk(
+                            ctx.Response.BodyWriter,
+                            state.RequestId,
+                            nowSec,
+                            modelName,
+                            promptTokens,
+                            completionTokens,
+                            promptTokens + completionTokens);
+                    }
                     WriteSseDone(ctx.Response.BodyWriter);
                     await ctx.Response.BodyWriter.FlushAsync(requestCts.Token);
                 }
@@ -219,19 +269,32 @@ public static class OpenAiEndpoints
         // GET /v1/models
         app.MapGet("/v1/models", async ctx =>
         {
+            var adapters = engine.GetLoadedLoraAdapters();
+            var cards = new List<ModelCard>(1 + adapters.Count)
+            {
+                new ModelCard
+                {
+                    Id = defaultModelName,
+                    Object = "model",
+                    Created = 1710000000,
+                    OwnedBy = "glacier"
+                }
+            };
+            for (int i = 0; i < adapters.Count; i++)
+            {
+                cards.Add(new ModelCard
+                {
+                    Id = $"{defaultModelName}:{adapters[i]}",
+                    Object = "model",
+                    Created = 1710000000,
+                    OwnedBy = "glacier-lora"
+                });
+            }
+
             var res = new ModelListResponse
             {
                 Object = "list",
-                Data =
-                [
-                    new ModelCard
-                    {
-                        Id = defaultModelName,
-                        Object = "model",
-                        Created = 1710000000,
-                        OwnedBy = "glacier"
-                    }
-                ]
+                Data = cards
             };
             await ctx.Response.WriteJsonAsync(res, ServeJsonContext.Default.ModelListResponse, ctx.RequestAborted);
         });
@@ -258,6 +321,20 @@ public static class OpenAiEndpoints
             {
                 Message = message,
                 Type = "invalid_request_error"
+            }
+        };
+        return response.WriteJsonAsync(err, ServeJsonContext.Default.ApiErrorResponse);
+    }
+
+    private static ValueTask WriteNotFoundAsync(HttpResponse response, string message)
+    {
+        response.StatusCode = 404;
+        var err = new ApiErrorResponse
+        {
+            Error = new ApiErrorDetail
+            {
+                Message = message,
+                Type = "model_not_found"
             }
         };
         return response.WriteJsonAsync(err, ServeJsonContext.Default.ApiErrorResponse);
@@ -344,6 +421,10 @@ public static class OpenAiEndpoints
     private static ReadOnlySpan<byte> SseTextSuffix => "\",\"index\":0,\"finish_reason\":null}]}\n\n"u8;
     private static ReadOnlySpan<byte> SseTextFinishChoices => "\",\"choices\":[{\"text\":\"\",\"index\":0,\"finish_reason\":\""u8;
     private static ReadOnlySpan<byte> SseFinishSuffix => "\"}]}\n\n"u8;
+    private static ReadOnlySpan<byte> SseUsageChoicesPrefix => "\",\"choices\":[],\"usage\":{\"prompt_tokens\":"u8;
+    private static ReadOnlySpan<byte> SseUsageCompletionPrefix => ",\"completion_tokens\":"u8;
+    private static ReadOnlySpan<byte> SseUsageTotalPrefix => ",\"total_tokens\":"u8;
+    private static ReadOnlySpan<byte> SseUsageSuffix => "}}\n\n"u8;
     private static ReadOnlySpan<byte> SseDone => "data: [DONE]\n\n"u8;
 
     private static int GetMaxJsonEscapedByteCount(string s) => checked(s.Length * 6 + 4);
@@ -420,6 +501,61 @@ public static class OpenAiEndpoints
         SseTextFinishChoices.CopyTo(span[written..]); written += SseTextFinishChoices.Length;
         written += WriteJsonEscapedUtf8(finishReason, span[written..]);
         SseFinishSuffix.CopyTo(span[written..]); written += SseFinishSuffix.Length;
+
+        writer.Advance(written);
+    }
+
+    private static void WriteChatSseUsageChunk(
+        PipeWriter writer,
+        string requestId,
+        long nowSec,
+        string modelName,
+        int promptTokens,
+        int completionTokens,
+        int totalTokens)
+    {
+        WriteSseUsageChunk(writer, SseChatObject, requestId, nowSec, modelName, promptTokens, completionTokens, totalTokens);
+    }
+
+    private static void WriteTextCompletionSseUsageChunk(
+        PipeWriter writer,
+        string requestId,
+        long nowSec,
+        string modelName,
+        int promptTokens,
+        int completionTokens,
+        int totalTokens)
+    {
+        WriteSseUsageChunk(writer, SseTextObject, requestId, nowSec, modelName, promptTokens, completionTokens, totalTokens);
+    }
+
+    private static void WriteSseUsageChunk(
+        PipeWriter writer,
+        ReadOnlySpan<byte> objectSpan,
+        string requestId,
+        long nowSec,
+        string modelName,
+        int promptTokens,
+        int completionTokens,
+        int totalTokens)
+    {
+        int maxBytes = GetMaxJsonEscapedByteCount(modelName) + Encoding.UTF8.GetMaxByteCount(requestId.Length) + 512;
+        var span = writer.GetSpan(maxBytes);
+        int written = 0;
+
+        SsePrefix.CopyTo(span[written..]); written += SsePrefix.Length;
+        written += Encoding.UTF8.GetBytes(requestId, span[written..]);
+        objectSpan.CopyTo(span[written..]); written += objectSpan.Length;
+        Utf8Formatter.TryFormat(nowSec, span[written..], out int secLen); written += secLen;
+        SseModel.CopyTo(span[written..]); written += SseModel.Length;
+        written += WriteJsonEscapedUtf8(modelName, span[written..]);
+        SseUsageChoicesPrefix.CopyTo(span[written..]); written += SseUsageChoicesPrefix.Length;
+        Utf8Formatter.TryFormat(promptTokens, span[written..], out int ptLen); written += ptLen;
+        SseUsageCompletionPrefix.CopyTo(span[written..]); written += SseUsageCompletionPrefix.Length;
+        Utf8Formatter.TryFormat(completionTokens, span[written..], out int ctLen); written += ctLen;
+        SseUsageTotalPrefix.CopyTo(span[written..]); written += SseUsageTotalPrefix.Length;
+        Utf8Formatter.TryFormat(totalTokens, span[written..], out int ttLen); written += ttLen;
+        SseUsageSuffix.CopyTo(span[written..]); written += SseUsageSuffix.Length;
 
         writer.Advance(written);
     }

@@ -1,14 +1,19 @@
 using System;
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
+using System.IO.Hashing;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
+using Glacier.Inference.Engine;
 using Glacier.Inference.Gguf;
+using Glacier.Inference.Memory;
 using Glacier.Inference.Model;
 using Glacier.Inference.Sampling;
 using Glacier.Inference.Tokenizer;
@@ -38,6 +43,20 @@ public sealed class ContinuousBatchEngine : IDisposable
     private readonly int _maxSeqLen;
     private readonly int _prefillChunkSize;
     private readonly int _defaultReasoningLoopMinPeriod;
+    private readonly int _defaultMaxReasoningTokens;
+    private readonly bool _enableSpeculativeDecoding;
+    private readonly int _maxDraftTokens;
+    private readonly int _speculativeBatchThreshold;
+    private readonly string? _mtpSidecarPath;
+    private readonly bool _mtpConfigured;
+    private readonly PromptLookupDraftProvider _promptLookupProvider;
+    private readonly CostGatedDraftPolicy _draftPolicy;
+    private readonly ConcurrentStack<MtpDraftProvider> _mtpPool = new();
+    private readonly ConcurrentStack<float[]> _hiddenHistoryPool = new();
+
+    private sealed record LoadedLoraEntry(LoraAdapterWeights Weights, ulong InstanceId, string SourcePath);
+    private readonly ConcurrentDictionary<string, LoadedLoraEntry> _loraAdapters = new(StringComparer.Ordinal);
+    private long _loraInstanceEpoch;
 
     private readonly Channel<SequenceState> _waitingQueue = Channel.CreateUnbounded<SequenceState>(new UnboundedChannelOptions
     {
@@ -55,17 +74,38 @@ public sealed class ContinuousBatchEngine : IDisposable
     private int _activeSequenceCount;
     private long _totalTokensGenerated;
     private long _totalRequestsServed;
+    private long _speculativeSteps;
+    private long _speculativeDraftTokensProposed;
+    private long _speculativeDraftTokensAccepted;
+    private long _speculativePromptLookupRounds;
+    private long _speculativeMtpRounds;
+    private long _speculativeSerialFallbackRounds;
     private double _lastIterationMs;
     private volatile Exception? _faultException;
     private AutonomousSleepDaemon? _sleepDaemon;
+    private SleepMemoryService? _sleepMemory;
     private ISleepExpansionRouter? _expansionRouter;
     private float _expansionResidualScale = 1.0f;
     private int _sleepVectorDimension = 64;
-    private bool _disposed;
+    private int _disposed;
 
     public AutonomousSleepDaemon? SleepDaemon => _sleepDaemon;
+    public SleepMemoryService? SleepMemory => _sleepMemory;
     public ISleepExpansionRouter? ExpansionRouter => _expansionRouter;
     public int SleepVectorDimension => _sleepVectorDimension;
+
+    public void AttachSleepMemory(
+        SleepMemoryService sleepMemory,
+        bool attachDaemonAndExpansion = true,
+        float expansionResidualScale = 1.0f)
+    {
+        ArgumentNullException.ThrowIfNull(sleepMemory);
+        _sleepMemory = sleepMemory;
+        if (attachDaemonAndExpansion)
+        {
+            AttachSleepDaemon(sleepMemory.Daemon, vectorDimension: 64, sleepMemory.ExpansionBank, expansionResidualScale);
+        }
+    }
 
     public void AttachSleepDaemon(
         AutonomousSleepDaemon daemon,
@@ -99,12 +139,22 @@ public sealed class ContinuousBatchEngine : IDisposable
     public int PrefillChunkSize => _prefillChunkSize;
     public bool IsGpuAccelerated => _runner.IsGpuAccelerated;
     public string ActiveBackend => _runner.BackendName;
+    public KvCachePrecision KvPrecision => _pool.Precision;
     public int ActiveBatchSize => Volatile.Read(ref _activeSequenceCount);
     public int WaitingQueueLength => Volatile.Read(ref _waitingCount);
     public PagedBlockPool BlockPool => _pool;
+    internal int HiddenHistoryPoolCount => _hiddenHistoryPool.Count;
     public BpeTokenizer Tokenizer => _tokenizer;
     public long TotalTokensGenerated => Interlocked.Read(ref _totalTokensGenerated);
     public long TotalRequestsServed => Interlocked.Read(ref _totalRequestsServed);
+    public bool IsSpeculativeDecodingActive => _enableSpeculativeDecoding && _maxDraftTokens > 0 && ActiveBatchSize <= _speculativeBatchThreshold;
+    public long SpeculativeSteps => Interlocked.Read(ref _speculativeSteps);
+    public long SpeculativeDraftTokensProposed => Interlocked.Read(ref _speculativeDraftTokensProposed);
+    public long SpeculativeDraftTokensAccepted => Interlocked.Read(ref _speculativeDraftTokensAccepted);
+    public long SpeculativePromptLookupRounds => Interlocked.Read(ref _speculativePromptLookupRounds);
+    public long SpeculativeMtpRounds => Interlocked.Read(ref _speculativeMtpRounds);
+    public long SpeculativeSerialFallbackRounds => Interlocked.Read(ref _speculativeSerialFallbackRounds);
+    public CostGatedDraftPolicy DraftPolicy => _draftPolicy;
     public double LastIterationMs => Volatile.Read(ref _lastIterationMs);
     public double ThroughputTokensPerSec => TotalTokensGenerated / Math.Max(0.001, _uptime.Elapsed.TotalSeconds);
 
@@ -116,13 +166,21 @@ public sealed class ContinuousBatchEngine : IDisposable
         int? seed = null,
         int defaultReasoningLoopMinPeriod = 1,
         bool useGpu = true,
-        int prefillChunkSize = DefaultPrefillChunkSize)
+        int prefillChunkSize = DefaultPrefillChunkSize,
+        int defaultMaxReasoningTokens = 0,
+        KvCachePrecision kvCachePrecision = KvCachePrecision.Auto,
+        bool enableSpeculativeDecoding = true,
+        int maxDraftTokens = 4,
+        int speculativeBatchThreshold = 4,
+        string? mtpSidecarPath = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(modelPath);
         ArgumentOutOfRangeException.ThrowIfLessThan(totalKvBlocks, 1);
         ArgumentOutOfRangeException.ThrowIfLessThan(maxBatchSize, 1);
         ArgumentOutOfRangeException.ThrowIfLessThan(maxSeqLen, 2);
         ArgumentOutOfRangeException.ThrowIfLessThan(prefillChunkSize, 1);
+        ArgumentOutOfRangeException.ThrowIfNegative(maxDraftTokens);
+        ArgumentOutOfRangeException.ThrowIfLessThan(speculativeBatchThreshold, 1);
 
         _gguf = GgufFile.Open(modelPath);
         try
@@ -134,6 +192,18 @@ public sealed class ContinuousBatchEngine : IDisposable
             _maxSeqLen = maxSeqLen;
             _prefillChunkSize = prefillChunkSize;
             _defaultReasoningLoopMinPeriod = defaultReasoningLoopMinPeriod;
+            _defaultMaxReasoningTokens = defaultMaxReasoningTokens;
+            _enableSpeculativeDecoding = enableSpeculativeDecoding;
+            _maxDraftTokens = maxDraftTokens;
+            _speculativeBatchThreshold = speculativeBatchThreshold;
+            _mtpSidecarPath = string.IsNullOrWhiteSpace(mtpSidecarPath) ? null : mtpSidecarPath;
+            _promptLookupProvider = new PromptLookupDraftProvider(minMatchLength: 2, maxMatchLength: 4);
+            _draftPolicy = new CostGatedDraftPolicy();
+
+            if (_mtpSidecarPath != null && !File.Exists(_mtpSidecarPath))
+            {
+                throw new FileNotFoundException($"MTP sidecar GGUF not found: '{_mtpSidecarPath}'.", _mtpSidecarPath);
+            }
 
             int runnerBatchCapacity = Math.Max(_maxBatchSize, _prefillChunkSize);
             if (useGpu && CudaPagedTransformerRunner.TryCreate(
@@ -142,6 +212,7 @@ public sealed class ContinuousBatchEngine : IDisposable
                 PagedBlockPool.DefaultBlockSize,
                 _maxSeqLen,
                 runnerBatchCapacity,
+                kvCachePrecision,
                 out var cudaRunner))
             {
                 _runner = cudaRunner;
@@ -152,7 +223,8 @@ public sealed class ContinuousBatchEngine : IDisposable
                     _weights.HeadDim,
                     blockSize: PagedBlockPool.DefaultBlockSize,
                     vHeadDim: _weights.ValueDim,
-                    allocateHostBuffers: false);
+                    allocateHostBuffers: false,
+                    kvPrecision: cudaRunner.KvPrecision);
             }
             else
             {
@@ -164,13 +236,36 @@ public sealed class ContinuousBatchEngine : IDisposable
                     _weights.HeadDim,
                     blockSize: PagedBlockPool.DefaultBlockSize,
                     vHeadDim: _weights.ValueDim,
-                    allocateHostBuffers: true);
+                    allocateHostBuffers: true,
+                    kvPrecision: kvCachePrecision);
+            }
+
+            bool hasMtpSource = _weights.EmbeddedMtpBlockIndex >= 0 || _mtpSidecarPath != null;
+            if (_enableSpeculativeDecoding && _maxDraftTokens > 0 && hasMtpSource && _runner is IHiddenStateSource trunkSource)
+            {
+                trunkSource.EnablePositionHistory();
+                if (_runner is PagedTransformerRunner)
+                {
+                    MtpDraftProvider? initialMtp = CreateMtpProvider(trunkSource);
+                    if (initialMtp != null)
+                    {
+                        _mtpPool.Push(initialMtp);
+                        _mtpConfigured = true;
+                    }
+                }
+                else
+                {
+                    _mtpConfigured = true;
+                }
             }
 
             _loopTask = Task.Run(RunIterationLoopAsync);
         }
         catch
         {
+            while (_mtpPool.TryPop(out var mtp))
+                mtp.Dispose();
+            _promptLookupProvider?.Dispose();
             _runner?.Dispose();
             _pool?.Dispose();
             _cts.Dispose();
@@ -180,17 +275,180 @@ public sealed class ContinuousBatchEngine : IDisposable
     }
 
     /// <summary>
+    /// Hot-loads or atomically replaces a <c>0x41524F4C</c> LoRA adapter without reloading the base model.
+    /// </summary>
+    public void LoadLoraAdapter(string name, string path)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+
+        string trimmedName = name.Trim();
+        if (trimmedName.Contains(':', StringComparison.Ordinal))
+            throw new ArgumentException("LoRA adapter name cannot contain ':'.", nameof(name));
+
+        string resolvedPath = Directory.Exists(path)
+            ? Path.Combine(path, "adapter_model.bin")
+            : path;
+
+        var weights = LoraAdapterWeights.Load(resolvedPath);
+        ValidateLoraDimensions(weights);
+
+        ulong instanceId = (ulong)Interlocked.Increment(ref _loraInstanceEpoch);
+        _loraAdapters[trimmedName] = new LoadedLoraEntry(weights, instanceId, resolvedPath);
+    }
+
+    /// <summary>
+    /// Unloads a previously registered LoRA adapter. Any in-flight sequences keep their captured adapter weights until completion.
+    /// </summary>
+    public bool UnloadLoraAdapter(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return false;
+
+        return _loraAdapters.TryRemove(name.Trim(), out _);
+    }
+
+    /// <summary>
+    /// Returns a deterministic snapshot of currently loaded LoRA adapter names.
+    /// </summary>
+    public IReadOnlyList<string> GetLoadedLoraAdapters()
+    {
+        var keys = new List<string>(_loraAdapters.Keys);
+        keys.Sort(StringComparer.Ordinal);
+        return keys.ToArray();
+    }
+
+    private void ValidateLoraDimensions(LoraAdapterWeights weights)
+    {
+        if (weights.LayerCount > _weights.BlockCount)
+        {
+            throw new InvalidDataException(
+                $"LoRA adapter layer count ({weights.LayerCount}) exceeds model layer count ({_weights.BlockCount}).");
+        }
+
+        int dim = _weights.EmbeddingLength;
+        int ffnDim = _weights.FeedForwardLength;
+        int qDim = _weights.HeadCount * _weights.HeadDim;
+        int kvDim = _weights.HeadCountKv * _weights.HeadDim;
+        int vHeadDim = _weights.ValueDim > 0 ? _weights.ValueDim : _weights.HeadDim;
+        int vDim = _weights.HeadCountKv * vHeadDim;
+        int outDim = _weights.HeadCount * vHeadDim;
+
+        int layersToCheck = Math.Min(weights.LayerCount, _weights.BlockCount);
+        for (int l = 0; l < layersToCheck; l++)
+        {
+            var lp = weights.GetProjections(l);
+            ValidateLoraSlot(lp.Q, l, LoraProjection.Q, dim, qDim);
+            ValidateLoraSlot(lp.K, l, LoraProjection.K, dim, kvDim);
+            ValidateLoraSlot(lp.V, l, LoraProjection.V, dim, vDim);
+            ValidateLoraSlot(lp.AttnOut, l, LoraProjection.AttnOut, outDim, dim);
+            ValidateLoraSlot(lp.Gate, l, LoraProjection.Gate, dim, ffnDim);
+            ValidateLoraSlot(lp.Up, l, LoraProjection.Up, dim, ffnDim);
+            ValidateLoraSlot(lp.Down, l, LoraProjection.Down, ffnDim, dim);
+        }
+    }
+
+    private static void ValidateLoraSlot(
+        (float[]? A, float[]? B, int inDim, int outDim) slot,
+        int layer,
+        LoraProjection proj,
+        int expectedIn,
+        int expectedOut)
+    {
+        if (slot.A == null && slot.B == null)
+            return;
+
+        if ((slot.inDim > 0 && slot.inDim != expectedIn) ||
+            (slot.outDim > 0 && slot.outDim != expectedOut))
+        {
+            throw new InvalidDataException(
+                $"LoRA projection {proj} at layer {layer} dimension mismatch: expected [{expectedIn}, {expectedOut}], got [{slot.inDim}, {slot.outDim}].");
+        }
+    }
+
+    private (string? Name, LoadedLoraEntry? Entry) ResolveLoraAdapter(InferenceRequest request, string? defaultModelName)
+    {
+        string? explicitLora = null;
+        if (request.Lora != null)
+        {
+            if (string.IsNullOrWhiteSpace(request.Lora))
+                throw new ArgumentException("LoRA adapter name cannot be empty or whitespace.", nameof(request));
+            explicitLora = request.Lora.Trim();
+        }
+
+        string? modelLora = null;
+        string rawModel = request.Model?.Trim() ?? string.Empty;
+        if (!string.IsNullOrEmpty(rawModel))
+        {
+            bool isExactDefaultModel = defaultModelName != null &&
+                string.Equals(rawModel, defaultModelName, StringComparison.OrdinalIgnoreCase);
+
+            if (!isExactDefaultModel)
+            {
+                int colonIdx = rawModel.LastIndexOf(':');
+                if (colonIdx >= 0)
+                {
+                    string basePart = rawModel[..colonIdx].Trim();
+                    string adapterPart = rawModel[(colonIdx + 1)..].Trim();
+                    if (string.IsNullOrEmpty(basePart) || string.IsNullOrEmpty(adapterPart))
+                    {
+                        throw new ArgumentException($"Invalid model:adapter specifier '{rawModel}'.", nameof(request));
+                    }
+                    modelLora = adapterPart;
+                }
+            }
+        }
+
+        if (modelLora != null && explicitLora != null &&
+            !string.Equals(modelLora, explicitLora, StringComparison.Ordinal))
+        {
+            throw new ArgumentException(
+                $"Conflicting LoRA adapter selection between model '{rawModel}' ('{modelLora}') and lora '{explicitLora}'.",
+                nameof(request));
+        }
+
+        string? selectedName = modelLora ?? explicitLora;
+        if (selectedName == null)
+            return (null, null);
+
+        if (!_loraAdapters.TryGetValue(selectedName, out var entry))
+            throw new KeyNotFoundException($"Unknown LoRA adapter '{selectedName}'.");
+
+        return (selectedName, entry);
+    }
+
+    private static ulong ComputeAdapterSeedHash(ulong instanceId, string adapterName)
+    {
+        ulong hash = XxHash3.HashToUInt64(MemoryMarshal.AsBytes(adapterName.AsSpan()), (long)instanceId);
+        return hash == 0UL ? (instanceId | 1UL) : hash;
+    }
+
+    /// <summary>
     /// Enqueues a new inference request into the continuous batch queue.
     /// Throws <see cref="ArgumentOutOfRangeException"/> if the prompt is empty or meets/exceeds <see cref="MaxSeqLen"/>.
     /// </summary>
-    public async Task<(SequenceState State, IAsyncEnumerable<string> TokenStream)> EnqueueAsync(InferenceRequest request, CancellationToken ct = default)
+    public Task<(SequenceState State, IAsyncEnumerable<string> TokenStream)> EnqueueAsync(InferenceRequest request, CancellationToken ct = default) =>
+        EnqueueAsync(request, defaultModelName: null, ct);
+
+    /// <summary>
+    /// Enqueues a new inference request into the continuous batch queue using an optional <paramref name="defaultModelName"/>
+    /// to disambiguate base model names that contain colons (e.g. <c>qwen2.5:7b</c>).
+    /// </summary>
+    public async Task<(SequenceState State, IAsyncEnumerable<string> TokenStream)> EnqueueAsync(
+        InferenceRequest request,
+        string? defaultModelName,
+        CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        ct.ThrowIfCancellationRequested();
         if (_faultException is Exception loopFault)
         {
             throw new InvalidOperationException("ContinuousBatchEngine background loop faulted and cannot accept new requests.", loopFault);
         }
+
+        var (loraName, loraEntry) = ResolveLoraAdapter(request, defaultModelName);
 
         float temp = request.EffectiveTemperature;
         float topP = request.EffectiveTopP;
@@ -203,7 +461,44 @@ public sealed class ContinuousBatchEngine : IDisposable
         if (repPenalty <= 0f || float.IsNaN(repPenalty))
             throw new ArgumentOutOfRangeException(nameof(request), repPenalty, "RepetitionPenalty must be greater than zero.");
 
-        string promptText = FormatPrompt(request);
+        int configuredBudget = request.GetEffectiveReasoningBudget(_defaultMaxReasoningTokens);
+        if (configuredBudget < ReasoningBudgetPolicy.AutoBudgetSentinel)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(request),
+                configuredBudget,
+                $"Reasoning budget ({configuredBudget}) must be >= {ReasoningBudgetPolicy.AutoBudgetSentinel}.");
+        }
+
+        string? rawUserQueryForSleep = null;
+        string promptText;
+        var sleepMemory = _sleepMemory;
+        if (sleepMemory != null)
+        {
+            if (request.Messages != null && request.Messages.Count > 0)
+            {
+                for (int i = request.Messages.Count - 1; i >= 0; i--)
+                {
+                    if (string.Equals(request.Messages[i].Role, "user", StringComparison.OrdinalIgnoreCase))
+                    {
+                        rawUserQueryForSleep = request.Messages[i].Content;
+                        break;
+                    }
+                }
+                var consolidated = await sleepMemory.ConsolidateMessagesAsync(request.Messages, ct).ConfigureAwait(false);
+                promptText = FormatMessages(consolidated, request.EffectiveEnableThinking);
+            }
+            else
+            {
+                rawUserQueryForSleep = request.Prompt;
+                promptText = await sleepMemory.ConsolidatePromptAsync(request.Prompt ?? string.Empty, ct).ConfigureAwait(false);
+            }
+        }
+        else
+        {
+            promptText = FormatPrompt(request);
+        }
+
         int[] promptTokens = _tokenizer.Encode(promptText);
 
         if (promptTokens.Length == 0 || promptTokens.Length >= _maxSeqLen)
@@ -219,104 +514,190 @@ public sealed class ContinuousBatchEngine : IDisposable
 
         string reqId = $"req-{Guid.NewGuid():N}";
         var blockTable = new BlockTable(_pool);
-        int blockSize = _pool.BlockSize;
-        int fullBlocks = promptTokens.Length / blockSize;
-        int matchedBlocks = 0;
-        ulong runningHash = 0UL;
-        Span<int> matchedBlockIds = stackalloc int[Math.Min(fullBlocks, 128)];
-        List<int>? dynamicMatched = null;
+        bool captureHiddenStates = _mtpConfigured && RunnerSupportsHiddenStateForSequence(loraEntry?.Weights);
+        SequenceState? state = null;
+        float[]? rentedHidden = null;
 
-        for (int b = 0; b < fullBlocks; b++)
-        {
-            ReadOnlySpan<int> blockTokens = promptTokens.AsSpan(b * blockSize, blockSize);
-            ulong blockHash = PagedBlockPool.ComputePrefixHash(runningHash, blockTokens);
-            if (_pool.TryFindPrefixBlock(blockHash, out int pBlockId))
-            {
-                runningHash = blockHash;
-                if (matchedBlocks < matchedBlockIds.Length)
-                {
-                    matchedBlockIds[matchedBlocks] = pBlockId;
-                }
-                else
-                {
-                    dynamicMatched ??= new List<int>(matchedBlockIds.ToArray());
-                    dynamicMatched.Add(pBlockId);
-                }
-                matchedBlocks++;
-            }
-            else
-            {
-                break;
-            }
-        }
-
-        if (matchedBlocks > 0)
-        {
-            if (dynamicMatched != null)
-            {
-                blockTable.AttachPrefixBlocks(CollectionsMarshal.AsSpan(dynamicMatched), matchedBlocks * blockSize);
-            }
-            else
-            {
-                blockTable.AttachPrefixBlocks(matchedBlockIds.Slice(0, matchedBlocks), matchedBlocks * blockSize);
-            }
-        }
-
-        var state = new SequenceState(
-            requestId: reqId,
-            promptTokens: promptTokens,
-            blockTable: blockTable,
-            maxNewTokens: effectiveMaxNewTokens,
-            temperature: temp,
-            topP: topP,
-            stopSequences: NormalizeStopSequences(request.EffectiveStop),
-            repetitionPenalty: repPenalty,
-            topK: request.EffectiveTopK,
-            seed: request.EffectiveSeed,
-            cancellationToken: ct)
-        {
-            PrefilledTokens = matchedBlocks * blockSize,
-            CurrentPos = matchedBlocks * blockSize,
-            BoundPrefixBlocks = matchedBlocks,
-            LastPrefixHash = runningHash
-        };
-
-        if (_tokenizer.TryGetTokenId("<think>", out int thinkId))
-            state.SamplingOptions.ThinkTokenId = thinkId;
-        if (_tokenizer.TryGetTokenId("</think>", out int endThinkId))
-            state.SamplingOptions.EndThinkTokenId = endThinkId;
-        if (request.MaxReasoningTokens > 0)
-            state.SamplingOptions.MaxReasoningTokens = request.MaxReasoningTokens;
-        if (request.EnableReasoningLoopGuard.HasValue)
-            state.SamplingOptions.EnableReasoningLoopGuard = request.EnableReasoningLoopGuard.Value;
-        if (request.ReasoningLoopMinPeriod.HasValue)
-            state.SamplingOptions.ReasoningLoopMinPeriod = request.ReasoningLoopMinPeriod.Value;
-        else if (_defaultReasoningLoopMinPeriod != 1)
-            state.SamplingOptions.ReasoningLoopMinPeriod = _defaultReasoningLoopMinPeriod;
-
-        if (state.SamplingOptions.ThinkTokenId >= 0)
-        {
-            int lastThink = Array.LastIndexOf(promptTokens, state.SamplingOptions.ThinkTokenId);
-            int lastEndThink = state.SamplingOptions.EndThinkTokenId >= 0 ? Array.LastIndexOf(promptTokens, state.SamplingOptions.EndThinkTokenId) : -1;
-            if (lastThink >= 0 && lastThink > lastEndThink)
-            {
-                state.IsInReasoningBlock = true;
-            }
-        }
-
-        Interlocked.Increment(ref _waitingCount);
-        _sleepDaemon?.RecordActivity();
         try
         {
-            await _waitingQueue.Writer.WriteAsync(state, ct);
+            AttachMatchedPrefixBlocks(
+                blockTable,
+                promptTokens,
+                loraEntry,
+                loraName,
+                captureHiddenStates,
+                out int matchedBlocks,
+                out ulong runningHash);
+
+            int blockSize = _pool.BlockSize;
+            rentedHidden = captureHiddenStates ? RentHiddenStateHistory() : null;
+
+            state = new SequenceState(
+                requestId: reqId,
+                promptTokens: promptTokens,
+                blockTable: blockTable,
+                maxNewTokens: effectiveMaxNewTokens,
+                temperature: temp,
+                topP: topP,
+                stopSequences: NormalizeStopSequences(request.EffectiveStop),
+                repetitionPenalty: repPenalty,
+                topK: request.EffectiveTopK,
+                seed: request.EffectiveSeed,
+                cancellationToken: ct)
+            {
+                PrefilledTokens = matchedBlocks * blockSize,
+                CurrentPos = matchedBlocks * blockSize,
+                BoundPrefixBlocks = matchedBlocks,
+                LastPrefixHash = runningHash,
+                LoraAdapterName = loraName,
+                LoraAdapter = loraEntry?.Weights,
+                LoraAdapterInstanceId = loraEntry?.InstanceId ?? 0UL,
+                RawUserQueryForSleep = rawUserQueryForSleep,
+                HiddenStateHistory = rentedHidden
+            };
+            rentedHidden = null;
+
+            if (_tokenizer.TryGetTokenId("<think>", out int thinkId))
+                state.SamplingOptions.ThinkTokenId = thinkId;
+            if (_tokenizer.TryGetTokenId("</think>", out int endThinkId))
+                state.SamplingOptions.EndThinkTokenId = endThinkId;
+
+            int resolvedBudget = (!request.HasExplicitReasoningBudget && request.EffectiveEnableThinking == false)
+                ? 0
+                : ReasoningBudgetPolicy.ResolveBudget(configuredBudget, effectiveMaxNewTokens);
+            state.SamplingOptions.MaxReasoningTokens = resolvedBudget;
+
+            if (request.EnableReasoningLoopGuard.HasValue)
+                state.SamplingOptions.EnableReasoningLoopGuard = request.EnableReasoningLoopGuard.Value;
+            if (request.ReasoningLoopMinPeriod.HasValue)
+                state.SamplingOptions.ReasoningLoopMinPeriod = request.ReasoningLoopMinPeriod.Value;
+            else if (_defaultReasoningLoopMinPeriod != 1)
+                state.SamplingOptions.ReasoningLoopMinPeriod = _defaultReasoningLoopMinPeriod;
+
+            state.InitializeReasoningTracker(
+                state.SamplingOptions.ThinkTokenId,
+                state.SamplingOptions.EndThinkTokenId,
+                resolvedBudget,
+                promptTokens,
+                promptText);
+
+            Interlocked.Increment(ref _waitingCount);
+            _sleepDaemon?.RecordActivity();
+            try
+            {
+                await _waitingQueue.Writer.WriteAsync(state, ct);
+            }
+            catch
+            {
+                Interlocked.Decrement(ref _waitingCount);
+                throw;
+            }
         }
         catch
         {
-            Interlocked.Decrement(ref _waitingCount);
+            if (state != null)
+            {
+                CancelAndRecycleSequence(state);
+            }
+            else
+            {
+                if (rentedHidden != null)
+                    _hiddenHistoryPool.Push(rentedHidden);
+                blockTable.ReleaseAll();
+            }
             throw;
         }
 
         return (state, ReadTokensAsync(state, ct));
+    }
+
+    private void AttachMatchedPrefixBlocks(
+        BlockTable blockTable,
+        int[] promptTokens,
+        LoadedLoraEntry? loraEntry,
+        string? loraName,
+        bool captureHiddenStates,
+        out int matchedBlocks,
+        out ulong runningHash)
+    {
+        int blockSize = _pool.BlockSize;
+        int fullBlocks = promptTokens.Length / blockSize;
+        matchedBlocks = 0;
+        runningHash = loraEntry != null ? ComputeAdapterSeedHash(loraEntry.InstanceId, loraName!) : 0UL;
+
+        if (captureHiddenStates || fullBlocks <= 0)
+            return;
+
+        Span<int> matchedBlockIds = stackalloc int[Math.Min(fullBlocks, 128)];
+        List<int>? dynamicMatched = null;
+        int pendingBlockId = -1;
+        try
+        {
+            for (int b = 0; b < fullBlocks; b++)
+            {
+                ReadOnlySpan<int> blockTokens = promptTokens.AsSpan(b * blockSize, blockSize);
+                ulong blockHash = PagedBlockPool.ComputePrefixHash(runningHash, blockTokens);
+                if (blockHash == 0UL) blockHash = 1UL;
+                if (_pool.TryFindPrefixBlock(blockHash, out int pBlockId))
+                {
+                    pendingBlockId = pBlockId;
+                    runningHash = blockHash;
+                    if (matchedBlocks < matchedBlockIds.Length)
+                    {
+                        matchedBlockIds[matchedBlocks] = pBlockId;
+                    }
+                    else
+                    {
+                        if (dynamicMatched == null)
+                        {
+                            var list = new List<int>(fullBlocks);
+                            foreach (int id in matchedBlockIds)
+                                list.Add(id);
+                            dynamicMatched = list;
+                        }
+                        dynamicMatched.Add(pBlockId);
+                    }
+                    pendingBlockId = -1;
+                    matchedBlocks++;
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            if (matchedBlocks > 0)
+            {
+                if (dynamicMatched != null)
+                {
+                    blockTable.AttachPrefixBlocks(CollectionsMarshal.AsSpan(dynamicMatched), matchedBlocks * blockSize);
+                }
+                else
+                {
+                    blockTable.AttachPrefixBlocks(matchedBlockIds.Slice(0, matchedBlocks), matchedBlocks * blockSize);
+                }
+            }
+        }
+        catch
+        {
+            int attached = blockTable.BlockCount;
+            if (matchedBlocks > attached)
+            {
+                if (dynamicMatched != null)
+                {
+                    _pool.FreeBlocks(CollectionsMarshal.AsSpan(dynamicMatched).Slice(attached));
+                }
+                else
+                {
+                    _pool.FreeBlocks(matchedBlockIds.Slice(attached, matchedBlocks - attached));
+                }
+            }
+            if (pendingBlockId >= 0)
+            {
+                _pool.FreeBlock(pendingBlockId);
+            }
+            throw;
+        }
     }
 
     private static async IAsyncEnumerable<string> ReadTokensAsync(SequenceState state, [EnumeratorCancellation] CancellationToken ct)
@@ -339,6 +720,7 @@ public sealed class ContinuousBatchEngine : IDisposable
         int[] batchPositions = new int[_maxBatchSize];
         bool[] successFlags = new bool[_maxBatchSize];
         var blockTables = new BlockTable[_maxBatchSize];
+        var batchLoras = new LoraAdapterWeights?[_maxBatchSize];
 
         try
         {
@@ -376,7 +758,7 @@ public sealed class ContinuousBatchEngine : IDisposable
                 if (_activeBatch.Count > 0)
                 {
                     _sleepDaemon?.RecordActivity();
-                    ExecuteDecodeStep(batchTokens, batchPositions, successFlags, blockTables);
+                    ExecuteDecodeStep(batchTokens, batchPositions, successFlags, blockTables, batchLoras);
                 }
 
                 // 4. Non-Blocking Chunked Batched Prefill Step (at most _prefillChunkSize tokens per tick)
@@ -427,7 +809,8 @@ public sealed class ContinuousBatchEngine : IDisposable
         int[] batchTokens,
         int[] batchPositions,
         bool[] successFlags,
-        BlockTable[] blockTables)
+        BlockTable[] blockTables,
+        LoraAdapterWeights?[] batchLoras)
     {
         // Guard against any sequence already at _maxSeqLen before invoking runner
         for (int i = _activeBatch.Count - 1; i >= 0; i--)
@@ -443,16 +826,67 @@ public sealed class ContinuousBatchEngine : IDisposable
             }
         }
 
+        int totalActiveCount = _prefillingBatch.Count + _activeBatch.Count;
+        Volatile.Write(ref _activeSequenceCount, totalActiveCount);
+
         int count = _activeBatch.Count;
         if (count == 0) return;
 
-        for (int i = 0; i < count; i++)
+        bool allowSpeculation = _enableSpeculativeDecoding &&
+                                _maxDraftTokens > 0 &&
+                                totalActiveCount <= _speculativeBatchThreshold;
+
+        if (!allowSpeculation)
+        {
+            ExecuteSerialForwardBatch(_activeBatch, batchTokens, batchPositions, successFlags, blockTables, batchLoras);
+        }
+        else
+        {
+            ExecuteSpeculativeOrSerialBatch(batchTokens, batchPositions, successFlags, blockTables, batchLoras);
+        }
+
+        // Dynamic eviction of finished or newly-cancelled sequences
+        for (int i = _activeBatch.Count - 1; i >= 0; i--)
         {
             var seq = _activeBatch[i];
+            if (seq.CancellationToken.IsCancellationRequested)
+            {
+                CancelAndRecycleSequence(seq);
+                _activeBatch.RemoveAt(i);
+            }
+            else if (seq.IsFinished)
+            {
+                CompleteAndRecycleSequence(seq);
+                _activeBatch.RemoveAt(i);
+            }
+        }
+    }
+
+    private void ExecuteSerialForwardBatch(
+        List<SequenceState> sequences,
+        int[] batchTokens,
+        int[] batchPositions,
+        bool[] successFlags,
+        BlockTable[] blockTables,
+        LoraAdapterWeights?[] batchLoras)
+    {
+        int count = sequences.Count;
+        if (count == 0) return;
+
+        float[]?[]? batchHistories = _mtpConfigured ? new float[]?[count] : null;
+        for (int i = 0; i < count; i++)
+        {
+            var seq = sequences[i];
             batchTokens[i] = seq.LastToken;
             batchPositions[i] = seq.CurrentPos;
             blockTables[i] = seq.BlockTable;
+            batchLoras[i] = seq.LoraAdapter;
+            if (batchHistories != null)
+                batchHistories[i] = seq.HiddenStateHistory;
         }
+
+        var hiddenCtx = _runner as IPagedHiddenStateContext;
+        hiddenCtx?.BindBatchHiddenStateHistories(batchHistories);
 
         int totalVocab = _weights.VocabSize;
         float[] batchLogits = ArrayPool<float>.Shared.Rent(count * totalVocab);
@@ -465,11 +899,12 @@ public sealed class ContinuousBatchEngine : IDisposable
                 _pool,
                 batchLogits.AsSpan(0, count * totalVocab),
                 successFlags.AsSpan(0, count),
-                computeLogits: true);
+                computeLogits: true,
+                batchLoras);
 
             for (int i = 0; i < count; i++)
             {
-                var seq = _activeBatch[i];
+                var seq = sequences[i];
                 if (seq.CancellationToken.IsCancellationRequested)
                 {
                     continue;
@@ -492,24 +927,404 @@ public sealed class ContinuousBatchEngine : IDisposable
         }
         finally
         {
+            hiddenCtx?.BindBatchHiddenStateHistories(null);
             ArrayPool<float>.Shared.Return(batchLogits);
         }
+    }
 
-        // Dynamic eviction of finished or newly-cancelled sequences
-        for (int i = _activeBatch.Count - 1; i >= 0; i--)
+    private void ExecuteSpeculativeOrSerialBatch(
+        int[] batchTokens,
+        int[] batchPositions,
+        bool[] successFlags,
+        BlockTable[] blockTables,
+        LoraAdapterWeights?[] batchLoras)
+    {
+        var serialBatch = new List<SequenceState>(_activeBatch.Count);
+        var hiddenCtx = _runner as IPagedHiddenStateContext;
+        int totalVocab = _weights.VocabSize;
+        int maxVerifyLen = _maxDraftTokens + 1;
+
+        int[] draftScratch = new int[_maxDraftTokens];
+        int[] verifyTokens = new int[maxVerifyLen];
+        var tokenHistoryScratch = new List<int>(256);
+
+        float[] verifyLogits = ArrayPool<float>.Shared.Rent(maxVerifyLen * totalVocab);
+        float[]? targetProbsArr = null;
+        float[]? residualProbsArr = null;
+        float[]? draftProbsArr = null;
+
+        try
         {
-            var seq = _activeBatch[i];
-            if (seq.CancellationToken.IsCancellationRequested)
+            for (int idx = 0; idx < _activeBatch.Count; idx++)
             {
-                CancelAndRecycleSequence(seq);
-                _activeBatch.RemoveAt(i);
+                var seq = _activeBatch[idx];
+                if (seq.CancellationToken.IsCancellationRequested)
+                    continue;
+
+                int remainingBudget = seq.MaxNewTokens - seq.GeneratedTokens.Count;
+                int maxPosBudget = _maxSeqLen - 1 - seq.CurrentPos;
+                int maxDraftForSeq = Math.Min(_maxDraftTokens, Math.Min(remainingBudget - 1, maxPosBudget));
+
+                if (seq.HasPendingForcedTokens || maxDraftForSeq <= 0)
+                {
+                    serialBatch.Add(seq);
+                    continue;
+                }
+
+                tokenHistoryScratch.Clear();
+                tokenHistoryScratch.AddRange(seq.PromptTokens);
+                tokenHistoryScratch.AddRange(seq.GeneratedTokens);
+                ReadOnlySpan<int> allTokens = CollectionsMarshal.AsSpan(tokenHistoryScratch);
+
+                int lookupCandidateCount = _promptLookupProvider.DraftWithMatchLength(
+                    allTokens,
+                    maxDraftForSeq,
+                    draftScratch,
+                    out int matchLen);
+
+                bool hasMtp = false;
+                if (_mtpConfigured &&
+                    allTokens.Length >= 2 &&
+                    seq.HiddenStateHistory != null &&
+                    RunnerSupportsHiddenStateForSequence(seq.LoraAdapter))
+                {
+                    seq.MtpDrafter ??= RentOrCreateMtpProvider();
+                    hasMtp = seq.MtpDrafter != null;
+                }
+
+                DraftDecision decision = _draftPolicy.SelectRoute(maxDraftForSeq, hasMtp, lookupCandidateCount, matchLen);
+                if (decision.Route == DraftRoute.Serial || decision.DraftCount <= 0)
+                {
+                    Interlocked.Increment(ref _speculativeSerialFallbackRounds);
+                    serialBatch.Add(seq);
+                    continue;
+                }
+
+                bool isGreedy = seq.SamplingOptions.Temperature <= Sampler.GreedyTemperatureThreshold ||
+                                seq.SamplingOptions.TopK == 1;
+
+                int draftedCount;
+                if (decision.Route == DraftRoute.PromptLookup)
+                {
+                    draftedCount = Math.Min(decision.DraftCount, lookupCandidateCount);
+                    if (!isGreedy && draftedCount > 0)
+                    {
+                        draftProbsArr ??= ArrayPool<float>.Shared.Rent(_maxDraftTokens * totalVocab);
+                        Span<float> draftProbsSpan = draftProbsArr.AsSpan(0, draftedCount * totalVocab);
+                        draftProbsSpan.Clear();
+                        for (int d = 0; d < draftedCount; d++)
+                        {
+                            int tok = draftScratch[d];
+                            if ((uint)tok < (uint)totalVocab)
+                                draftProbsSpan[d * totalVocab + tok] = 1.0f;
+                        }
+                    }
+                }
+                else if (decision.Route == DraftRoute.Mtp && seq.MtpDrafter != null)
+                {
+                    hiddenCtx?.BindHiddenStateHistory(seq.HiddenStateHistory);
+                    if (isGreedy)
+                    {
+                        draftedCount = seq.MtpDrafter.Draft(allTokens, decision.DraftCount, draftScratch);
+                    }
+                    else
+                    {
+                        draftProbsArr ??= ArrayPool<float>.Shared.Rent(_maxDraftTokens * totalVocab);
+                        Sampler draftSampler = seq.SequenceSampler ?? _sampler;
+                        draftedCount = seq.MtpDrafter.DraftWithProbabilities(
+                            allTokens,
+                            CollectionsMarshal.AsSpan(seq.GeneratedTokens),
+                            decision.DraftCount,
+                            seq.SamplingOptions,
+                            draftSampler,
+                            totalVocab,
+                            draftScratch,
+                            draftProbsArr.AsSpan(0, decision.DraftCount * totalVocab));
+                    }
+                }
+                else
+                {
+                    Interlocked.Increment(ref _speculativeSerialFallbackRounds);
+                    serialBatch.Add(seq);
+                    continue;
+                }
+
+                if (draftedCount <= 0)
+                {
+                    Interlocked.Increment(ref _speculativeSerialFallbackRounds);
+                    serialBatch.Add(seq);
+                    continue;
+                }
+
+                verifyTokens[0] = seq.LastToken;
+                draftScratch.AsSpan(0, draftedCount).CopyTo(verifyTokens.AsSpan(1, draftedCount));
+
+                int startPos = seq.CurrentPos;
+                int verifyLen = draftedCount + 1;
+                long roundStartTs = Stopwatch.GetTimestamp();
+
+                Interlocked.Increment(ref _speculativeSteps);
+                Interlocked.Add(ref _speculativeDraftTokensProposed, draftedCount);
+                if (decision.Route == DraftRoute.Mtp)
+                    Interlocked.Increment(ref _speculativeMtpRounds);
+                else
+                    Interlocked.Increment(ref _speculativePromptLookupRounds);
+
+                hiddenCtx?.BindHiddenStateHistory(seq.HiddenStateHistory);
+                bool verified = _runner.VerifyDraftChunk(
+                    verifyTokens.AsSpan(0, verifyLen),
+                    startPos,
+                    seq.BlockTable,
+                    _pool,
+                    verifyLogits.AsSpan(0, verifyLen * totalVocab),
+                    seq.LoraAdapter);
+                hiddenCtx?.BindHiddenStateHistory(null);
+
+                if (!verified)
+                {
+                    FlushDecoderAndPendingText(seq);
+                    seq.IsFinished = true;
+                    seq.FinishReason = "pool_oom";
+                    continue;
+                }
+
+                if (!isGreedy)
+                {
+                    targetProbsArr ??= ArrayPool<float>.Shared.Rent(totalVocab);
+                    residualProbsArr ??= ArrayPool<float>.Shared.Rent(totalVocab);
+                }
+
+                Sampler activeSampler = seq.SequenceSampler ?? _sampler;
+                int acceptedInStep = 0;
+                bool stopped = false;
+
+                for (int i = 0; i < draftedCount; i++)
+                {
+                    int candidate = draftScratch[i];
+                    Span<float> posLogits = verifyLogits.AsSpan(i * totalVocab, totalVocab);
+
+                    if (isGreedy)
+                    {
+                        int targetPred = SampleWithSequencePolicy(
+                            seq,
+                            posLogits,
+                            activeSampler,
+                            isGreedy: true,
+                            targetProbs: Span<float>.Empty,
+                            out bool periodicTriggered);
+
+                        if (candidate == targetPred)
+                        {
+                            acceptedInStep++;
+                            seq.CurrentPos = startPos + i + 1;
+                            CommitDecodedToken(seq, candidate, isFirstToken: false, periodicTriggered, out bool shouldForceCloseThink);
+                            if (seq.IsFinished || shouldForceCloseThink)
+                            {
+                                seq.BlockTable.TruncateTo(startPos + i + 1);
+                                stopped = true;
+                                break;
+                            }
+                        }
+                        else
+                        {
+                            seq.BlockTable.TruncateTo(startPos + i + 1);
+                            seq.CurrentPos = startPos + i + 1;
+                            CommitDecodedToken(seq, targetPred, isFirstToken: false, periodicTriggered, out _);
+                            stopped = true;
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        Span<float> targetProbs = targetProbsArr.AsSpan(0, totalVocab);
+                        SampleWithSequencePolicy(
+                            seq,
+                            posLogits,
+                            activeSampler,
+                            isGreedy: false,
+                            targetProbs,
+                            out bool periodicTriggered);
+
+                        ReadOnlySpan<float> qRow = draftProbsArr!.AsSpan(i * totalVocab, totalVocab);
+                        float pCandidate = (uint)candidate < (uint)totalVocab ? targetProbs[candidate] : 0f;
+                        float qCandidate = (uint)candidate < (uint)totalVocab ? qRow[candidate] : 0f;
+
+                        bool accept = qCandidate > 0f &&
+                                      (pCandidate >= qCandidate || activeSampler.Rng.NextDouble() < (pCandidate / qCandidate));
+
+                        if (accept)
+                        {
+                            acceptedInStep++;
+                            seq.CurrentPos = startPos + i + 1;
+                            CommitDecodedToken(seq, candidate, isFirstToken: false, periodicTriggered, out bool shouldForceCloseThink);
+                            if (seq.IsFinished || shouldForceCloseThink)
+                            {
+                                seq.BlockTable.TruncateTo(startPos + i + 1);
+                                stopped = true;
+                                break;
+                            }
+                        }
+                        else
+                        {
+                            int correctionToken = SampleResidualDistribution(
+                                targetProbs,
+                                qRow,
+                                residualProbsArr.AsSpan(0, totalVocab),
+                                activeSampler.Rng);
+                            seq.BlockTable.TruncateTo(startPos + i + 1);
+                            seq.CurrentPos = startPos + i + 1;
+                            CommitDecodedToken(seq, correctionToken, isFirstToken: false, periodicTriggered, out _);
+                            stopped = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!stopped && acceptedInStep == draftedCount)
+                {
+                    Span<float> bonusLogits = verifyLogits.AsSpan(draftedCount * totalVocab, totalVocab);
+                    int bonusToken;
+                    bool bonusPeriodic;
+                    if (isGreedy)
+                    {
+                        bonusToken = SampleWithSequencePolicy(
+                            seq,
+                            bonusLogits,
+                            activeSampler,
+                            isGreedy: true,
+                            targetProbs: Span<float>.Empty,
+                            out bonusPeriodic);
+                    }
+                    else
+                    {
+                        Span<float> targetProbs = targetProbsArr.AsSpan(0, totalVocab);
+                        SampleWithSequencePolicy(
+                            seq,
+                            bonusLogits,
+                            activeSampler,
+                            isGreedy: false,
+                            targetProbs,
+                            out bonusPeriodic);
+                        bonusToken = Sampler.SampleFromDistribution(targetProbs, activeSampler.Rng);
+                    }
+
+                    seq.CurrentPos = startPos + draftedCount + 1;
+                    CommitDecodedToken(seq, bonusToken, isFirstToken: false, bonusPeriodic, out _);
+                }
+
+                double roundElapsedMs = Stopwatch.GetElapsedTime(roundStartTs).TotalMilliseconds;
+                Interlocked.Add(ref _speculativeDraftTokensAccepted, acceptedInStep);
+                _draftPolicy.RecordOutcome(decision.Route, matchLen, draftedCount, acceptedInStep, roundElapsedMs);
             }
-            else if (seq.IsFinished)
+
+            if (serialBatch.Count > 0)
             {
-                CompleteAndRecycleSequence(seq);
-                _activeBatch.RemoveAt(i);
+                ExecuteSerialForwardBatch(serialBatch, batchTokens, batchPositions, successFlags, blockTables, batchLoras);
             }
         }
+        finally
+        {
+            hiddenCtx?.BindHiddenStateHistory(null);
+            ArrayPool<float>.Shared.Return(verifyLogits);
+            if (targetProbsArr != null) ArrayPool<float>.Shared.Return(targetProbsArr);
+            if (residualProbsArr != null) ArrayPool<float>.Shared.Return(residualProbsArr);
+            if (draftProbsArr != null) ArrayPool<float>.Shared.Return(draftProbsArr);
+        }
+    }
+
+    private int SampleWithSequencePolicy(
+        SequenceState seq,
+        Span<float> seqLogits,
+        Sampler activeSampler,
+        bool isGreedy,
+        Span<float> targetProbs,
+        out bool periodicTriggeredPreSample)
+    {
+        bool isReasoningActive = seq.IsInReasoningBlock;
+        ReadOnlySpan<int> recentTokens = CollectionsMarshal.AsSpan(seq.GeneratedTokens);
+        ReadOnlySpan<int> penaltyWindow = recentTokens;
+
+        bool origEnableLoopGuard = seq.SamplingOptions.EnableReasoningLoopGuard;
+        float origRepetitionPenalty = seq.SamplingOptions.RepetitionPenalty;
+        periodicTriggeredPreSample = false;
+
+        if (origEnableLoopGuard && isReasoningActive && !recentTokens.IsEmpty)
+        {
+            int loopPeriod = Sampler.DetectPeriodicReasoningLoop(
+                recentTokens,
+                minPeriod: seq.SamplingOptions.ReasoningLoopMinPeriod);
+            if (loopPeriod > 0)
+            {
+                periodicTriggeredPreSample = true;
+                seq.PeriodicLoopTriggers++;
+                seq.LoopRecoveryTriggers++;
+                seq.SamplingOptions.RepetitionPenalty = Math.Max(origRepetitionPenalty, seq.SamplingOptions.LoopRecoveryRepetitionPenalty);
+                int windowLen = Math.Min(recentTokens.Length, loopPeriod * 3);
+                penaltyWindow = recentTokens.Slice(recentTokens.Length - windowLen, windowLen);
+            }
+        }
+
+        seq.SamplingOptions.EnableReasoningLoopGuard = false;
+        ApplySleepExpansionResidual(seqLogits);
+        try
+        {
+            if (isGreedy)
+            {
+                return activeSampler.Sample(seqLogits, seq.SamplingOptions, penaltyWindow);
+            }
+
+            Sampler.ComputeFilteredDistribution(seqLogits, seq.SamplingOptions, penaltyWindow, targetProbs);
+            return 0;
+        }
+        finally
+        {
+            seq.SamplingOptions.EnableReasoningLoopGuard = origEnableLoopGuard;
+            seq.SamplingOptions.RepetitionPenalty = origRepetitionPenalty;
+        }
+    }
+
+    private static int SampleResidualDistribution(
+        ReadOnlySpan<float> p,
+        ReadOnlySpan<float> q,
+        Span<float> residualScratch,
+        Random rng)
+    {
+        int n = p.Length;
+        float sumResidual = 0f;
+        for (int v = 0; v < n; v++)
+        {
+            float diff = p[v] - q[v];
+            if (diff > 0f)
+            {
+                residualScratch[v] = diff;
+                sumResidual += diff;
+            }
+            else
+            {
+                residualScratch[v] = 0f;
+            }
+        }
+
+        if (!(sumResidual > 1e-12f) || !float.IsFinite(sumResidual))
+        {
+            return Sampler.SampleFromDistribution(p, rng);
+        }
+
+        float r = (float)rng.NextDouble() * sumResidual;
+        float acc = 0f;
+        int lastPositive = 0;
+        for (int v = 0; v < n; v++)
+        {
+            float w = residualScratch[v];
+            if (w <= 0f) continue;
+            lastPositive = v;
+            acc += w;
+            if (r <= acc)
+            {
+                return v;
+            }
+        }
+        return lastPositive;
     }
 
     private void ExecutePrefillChunkStep(float[] logitsBuffer)
@@ -529,13 +1344,17 @@ public sealed class ContinuousBatchEngine : IDisposable
         if (startPos >= promptLen)
         {
             // Fully cached prefix: evaluate final token to obtain logits for first token sampling
+            var hiddenCtx = _runner as IPagedHiddenStateContext;
+            hiddenCtx?.BindHiddenStateHistory(seq.HiddenStateHistory);
             bool tokenOk = _runner.ForwardToken(
                 seq.PromptTokens[promptLen - 1],
                 promptLen - 1,
                 seq.BlockTable,
                 _pool,
                 logitsBuffer.AsSpan(),
-                computeLogits: true);
+                computeLogits: true,
+                seq.LoraAdapter);
+            hiddenCtx?.BindHiddenStateHistory(null);
 
             if (!tokenOk)
             {
@@ -570,13 +1389,17 @@ public sealed class ContinuousBatchEngine : IDisposable
         int chunkLen = Math.Min(promptLen - startPos, _prefillChunkSize);
         bool isFinalChunk = (startPos + chunkLen == promptLen);
 
+        var chunkHiddenCtx = _runner as IPagedHiddenStateContext;
+        chunkHiddenCtx?.BindHiddenStateHistory(seq.HiddenStateHistory);
         bool ok = _runner.ForwardPrefillChunk(
             seq.PromptTokens.AsSpan(startPos, chunkLen),
             startPos,
             seq.BlockTable,
             _pool,
             isFinalChunk ? logitsBuffer.AsSpan() : Span<float>.Empty,
-            computeLogits: isFinalChunk);
+            computeLogits: isFinalChunk,
+            seq.LoraAdapter);
+        chunkHiddenCtx?.BindHiddenStateHistory(null);
 
         if (!ok)
         {
@@ -597,6 +1420,7 @@ public sealed class ContinuousBatchEngine : IDisposable
             int blockIdx = seq.BoundPrefixBlocks;
             ReadOnlySpan<int> blockTokens = seq.PromptTokens.AsSpan(blockIdx * blockSize, blockSize);
             seq.LastPrefixHash = PagedBlockPool.ComputePrefixHash(seq.LastPrefixHash, blockTokens);
+            if (seq.LastPrefixHash == 0UL) seq.LastPrefixHash = 1UL;
             int physicalId = seq.BlockTable.GetBlockId(blockIdx);
             _pool.BindPrefixBlock(seq.LastPrefixHash, physicalId);
             seq.BoundPrefixBlocks++;
@@ -632,62 +1456,54 @@ public sealed class ContinuousBatchEngine : IDisposable
 
     private void ProcessSampledToken(SequenceState seq, Span<float> seqLogits, bool isFirstToken)
     {
-        // 1. Dynamic reasoning token budgeting & logit clamping (strictly guarded behind EnableReasoningLoopGuard)
-        if (seq.SamplingOptions.EnableReasoningLoopGuard &&
-            seq.IsInReasoningBlock &&
-            seq.SamplingOptions.MaxReasoningTokens > 0 &&
-            seq.CurrentReasoningTokens >= seq.SamplingOptions.MaxReasoningTokens &&
-            seq.SamplingOptions.EndThinkTokenId >= 0)
+        // 0. If forced closing tokens (\n</think>\n\n) are queued, emit next queued token without sampling
+        if (seq.TryPopForcedToken(out int forcedToken))
         {
-            seq.BudgetClampTriggers++;
-            seq.LoopRecoveryTriggers++;
-            Sampler.ClampReasoningLogits(seqLogits, seq.SamplingOptions.EndThinkTokenId);
-        }
+            seq.LastToken = forcedToken;
+            seq.GeneratedTokens.Add(forcedToken);
+            Interlocked.Increment(ref _totalTokensGenerated);
+            DecodeTokenBytesIntoBuilder(seq, forcedToken);
 
-        // 2. Single-pass periodic reasoning-loop check ONLY when model has <think> and sequence is inside <think>...</think>
-        bool isReasoningActive = seq.SamplingOptions.ThinkTokenId >= 0 && seq.IsInReasoningBlock;
-        ReadOnlySpan<int> recentTokens = CollectionsMarshal.AsSpan(seq.GeneratedTokens);
-        ReadOnlySpan<int> penaltyWindow = recentTokens;
+            if (EmitOrStopOnSequences(seq))
+                return;
 
-        bool origEnableLoopGuard = seq.SamplingOptions.EnableReasoningLoopGuard;
-        float origRepetitionPenalty = seq.SamplingOptions.RepetitionPenalty;
-
-        if (origEnableLoopGuard && isReasoningActive && !recentTokens.IsEmpty)
-        {
-            int loopPeriod = Sampler.DetectPeriodicReasoningLoop(
-                recentTokens,
-                minPeriod: seq.SamplingOptions.ReasoningLoopMinPeriod);
-            if (loopPeriod > 0)
+            if (seq.GeneratedTokens.Count >= seq.MaxNewTokens || (!isFirstToken && seq.CurrentPos >= _maxSeqLen))
             {
-                seq.PeriodicLoopTriggers++;
-                seq.LoopRecoveryTriggers++;
-                seq.SamplingOptions.RepetitionPenalty = Math.Max(origRepetitionPenalty, seq.SamplingOptions.LoopRecoveryRepetitionPenalty);
-                int windowLen = Math.Min(recentTokens.Length, loopPeriod * 3);
-                penaltyWindow = recentTokens.Slice(recentTokens.Length - windowLen, windowLen);
+                FlushDecoderAndPendingText(seq);
+                seq.IsFinished = true;
+                seq.FinishReason = "length";
             }
+            return;
         }
 
-        // Prevent duplicate DetectPeriodicReasoningLoop scan inside Sampler.Sample
-        seq.SamplingOptions.EnableReasoningLoopGuard = false;
-        ApplySleepExpansionResidual(seqLogits);
-        int nextToken;
-        try
-        {
-            Sampler activeSampler = seq.SequenceSampler ?? _sampler;
-            nextToken = activeSampler.Sample(seqLogits, seq.SamplingOptions, penaltyWindow);
-        }
-        finally
-        {
-            seq.SamplingOptions.EnableReasoningLoopGuard = origEnableLoopGuard;
-            seq.SamplingOptions.RepetitionPenalty = origRepetitionPenalty;
-        }
+        // 1. Sample next token using per-sequence reasoning loop guard & sleep residual
+        Sampler activeSampler = seq.SequenceSampler ?? _sampler;
+        int nextToken = SampleWithSequencePolicy(
+            seq,
+            seqLogits,
+            activeSampler,
+            isGreedy: true,
+            targetProbs: Span<float>.Empty,
+            out bool periodicTriggeredPreSample);
 
         if (isFirstToken)
         {
             seq.FirstTokenTime = DateTimeOffset.UtcNow;
         }
 
-        // 3. EOS non-leakage check BEFORE appending to GeneratedTokens or emitting text
+        CommitDecodedToken(seq, nextToken, isFirstToken, periodicTriggeredPreSample, out _);
+    }
+
+    private void CommitDecodedToken(
+        SequenceState seq,
+        int nextToken,
+        bool isFirstToken,
+        bool periodicTriggeredPreSample,
+        out bool shouldForceCloseThink)
+    {
+        shouldForceCloseThink = false;
+
+        // 2. EOS non-leakage check BEFORE appending to GeneratedTokens or emitting text
         if (IsEosToken(nextToken))
         {
             FlushDecoderAndPendingText(seq);
@@ -696,27 +1512,50 @@ public sealed class ContinuousBatchEngine : IDisposable
             return;
         }
 
-        // 4. Record valid non-EOS token
+        // 3. Record valid non-EOS token
         seq.LastToken = nextToken;
         seq.GeneratedTokens.Add(nextToken);
         Interlocked.Increment(ref _totalTokensGenerated);
 
-        // Update reasoning block state
-        if (seq.SamplingOptions.ThinkTokenId >= 0 && nextToken == seq.SamplingOptions.ThinkTokenId)
-        {
-            seq.IsInReasoningBlock = true;
-        }
-        else if (seq.SamplingOptions.EndThinkTokenId >= 0 && nextToken == seq.SamplingOptions.EndThinkTokenId)
-        {
-            seq.IsInReasoningBlock = false;
-        }
-        else if (seq.IsInReasoningBlock)
-        {
-            seq.CurrentReasoningTokens++;
-        }
-
-        // 5. Incremental stateful UTF-8 decoding (prevents U+FFFD on split multi-byte BPE tokens)
+        // 4. Incremental stateful UTF-8 decoding (prevents U+FFFD on split multi-byte BPE tokens)
         DecodeTokenBytesIntoBuilder(seq, nextToken);
+
+        // 5. Update single-token or multi-token <think> reasoning tracker and detect forced close
+        bool useSingleTokenThinkDelimiters = seq.SamplingOptions.ThinkTokenId >= 0 && seq.SamplingOptions.EndThinkTokenId >= 0;
+        if (seq.SamplingOptions.MaxReasoningTokens > 0)
+        {
+            shouldForceCloseThink = seq.ObserveReasoningTokenAndShouldForceClose(nextToken, useSingleTokenThinkDelimiters);
+            if (shouldForceCloseThink)
+            {
+                seq.BudgetClampTriggers++;
+            }
+            else if (seq.SamplingOptions.EnableReasoningLoopGuard &&
+                     seq.IsInReasoningBlock &&
+                     !seq.ForcedThinkClose &&
+                     seq.CurrentReasoningTokens >= 24 &&
+                     Sampler.DetectPeriodicReasoningLoop(
+                         CollectionsMarshal.AsSpan(seq.GeneratedTokens),
+                         minPeriod: Math.Max(2, seq.SamplingOptions.ReasoningLoopMinPeriod),
+                         maxPeriod: 64,
+                         minRepeats: 4) > 0)
+            {
+                seq.MarkForcedThinkClose();
+                if (!periodicTriggeredPreSample)
+                {
+                    seq.PeriodicLoopTriggers++;
+                    seq.LoopRecoveryTriggers++;
+                }
+                shouldForceCloseThink = true;
+            }
+        }
+        else
+        {
+            seq.ObserveUnbudgetedReasoningToken(
+                nextToken,
+                seq.SamplingOptions.ThinkTokenId,
+                seq.SamplingOptions.EndThinkTokenId,
+                useSingleTokenThinkDelimiters);
+        }
 
         // 6. StopSequences holdback & truncation enforcement
         if (EmitOrStopOnSequences(seq))
@@ -730,6 +1569,17 @@ public sealed class ContinuousBatchEngine : IDisposable
             FlushDecoderAndPendingText(seq);
             seq.IsFinished = true;
             seq.FinishReason = "length";
+            return;
+        }
+
+        // 8. Queue forced \n</think>\n\n tokens if reasoning budget or loop guard triggered
+        if (shouldForceCloseThink)
+        {
+            int[] closeTokens = ReasoningBudgetPolicy.BuildEndThinkTokens(_tokenizer, seq.SamplingOptions.EndThinkTokenId);
+            if (closeTokens.Length > 0)
+            {
+                seq.EnqueueForcedTokens(closeTokens);
+            }
         }
     }
 
@@ -847,7 +1697,7 @@ public sealed class ContinuousBatchEngine : IDisposable
         }
     }
 
-    private static void SweepCancelledSequences(List<SequenceState> batch)
+    private void SweepCancelledSequences(List<SequenceState> batch)
     {
         for (int i = batch.Count - 1; i >= 0; i--)
         {
@@ -860,17 +1710,75 @@ public sealed class ContinuousBatchEngine : IDisposable
         }
     }
 
-    private static void CancelAndRecycleSequence(SequenceState seq)
+    private void CancelAndRecycleSequence(SequenceState seq)
     {
         seq.IsFinished = true;
         if (string.IsNullOrEmpty(seq.FinishReason))
             seq.FinishReason = "cancelled";
-        seq.BlockTable.ReleaseAll();
+        RecycleSequenceResources(seq);
+        try
+        {
+            seq.BlockTable.ReleaseAll();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
         seq.TokenChannel.Writer.TryComplete();
         if (seq.CancellationToken.IsCancellationRequested)
             seq.Completion.TrySetCanceled(seq.CancellationToken);
         else
             seq.Completion.TrySetCanceled();
+    }
+
+    private bool RunnerSupportsHiddenStateForSequence(LoraAdapterWeights? lora) =>
+        _runner is IPagedHiddenStateContext ctx && ctx.SupportsHiddenStateCapture(lora);
+
+    private float[] RentHiddenStateHistory()
+    {
+        if (_hiddenHistoryPool.TryPop(out var buffer))
+            return buffer;
+        return new float[checked(_maxSeqLen * _weights.EmbeddingLength)];
+    }
+
+    private MtpDraftProvider? RentOrCreateMtpProvider()
+    {
+        if (_mtpPool.TryPop(out var cached))
+            return cached;
+
+        if (_runner is not IHiddenStateSource trunk)
+            return null;
+
+        return CreateMtpProvider(trunk);
+    }
+
+    private MtpDraftProvider? CreateMtpProvider(IHiddenStateSource trunk)
+    {
+        if (_mtpSidecarPath != null)
+        {
+            return MtpDraftProvider.LoadFromSidecar(trunk, _weights, _maxSeqLen, _mtpSidecarPath);
+        }
+
+        if (_weights.EmbeddedMtpBlockIndex >= 0)
+        {
+            return MtpDraftProvider.TryCreateFromModel(trunk, _weights, _maxSeqLen);
+        }
+
+        return null;
+    }
+
+    private void RecycleSequenceResources(SequenceState seq)
+    {
+        if (seq.MtpDrafter != null)
+        {
+            seq.MtpDrafter.Reset();
+            _mtpPool.Push(seq.MtpDrafter);
+            seq.MtpDrafter = null;
+        }
+        if (seq.HiddenStateHistory != null)
+        {
+            _hiddenHistoryPool.Push(seq.HiddenStateHistory);
+            seq.HiddenStateHistory = null;
+        }
     }
 
     private void ApplySleepExpansionResidual(Span<float> logits)
@@ -911,11 +1819,28 @@ public sealed class ContinuousBatchEngine : IDisposable
 
     private void CompleteAndRecycleSequence(SequenceState seq)
     {
-        seq.BlockTable.ReleaseAll();
+        RecycleSequenceResources(seq);
+        try
+        {
+            seq.BlockTable.ReleaseAll();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
         seq.TokenChannel.Writer.TryComplete();
         string completedText = seq.GeneratedTextBuilder.ToString();
         seq.Completion.TrySetResult(completedText);
         Interlocked.Increment(ref _totalRequestsServed);
+
+        var sleepMemory = _sleepMemory;
+        if (sleepMemory != null)
+        {
+            if (seq.FinishReason == "stop" && !string.IsNullOrWhiteSpace(completedText))
+            {
+                sleepMemory.RecordTurnCompletion(seq.RawUserQueryForSleep, completedText);
+            }
+            return;
+        }
 
         var sleepDaemon = _sleepDaemon;
         if (sleepDaemon != null && seq.FinishReason == "stop" && !string.IsNullOrWhiteSpace(completedText))
@@ -995,37 +1920,64 @@ public sealed class ContinuousBatchEngine : IDisposable
     {
         if (req.Messages != null && req.Messages.Count > 0)
         {
-            var list = new List<(string Role, string Content)>(req.Messages.Count);
-            foreach (var m in req.Messages)
-            {
-                list.Add((m.Role, m.Content));
-            }
-            bool hasThinkToken = _tokenizer.TryGetTokenId("<think>", out _);
-            bool thinking = req.EnableThinking ?? hasThinkToken;
-            return _tokenizer.FormatConversation(list, thinkingMode: thinking);
+            return FormatMessages(req.Messages, req.EffectiveEnableThinking);
         }
         return req.Prompt ?? string.Empty;
     }
 
+    private string FormatMessages(IReadOnlyList<ChatMessage> messages, bool? effectiveEnableThinking)
+    {
+        var list = new List<(string Role, string Content)>(messages.Count);
+        foreach (var m in messages)
+        {
+            list.Add((m.Role, m.Content));
+        }
+        bool hasThinkToken = _tokenizer.TryGetTokenId("<think>", out _);
+        bool thinking = effectiveEnableThinking ?? hasThinkToken;
+        return _tokenizer.FormatConversation(list, thinkingMode: thinking);
+    }
+
     public void Dispose()
     {
-        if (!_disposed)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
+        _cts.Cancel();
+        _waitingQueue.Writer.TryComplete();
+        try
         {
-            _disposed = true;
-            _cts.Cancel();
-            _waitingQueue.Writer.TryComplete();
-            try
-            {
-                _loopTask.Wait(2000);
-            }
-            catch (Exception ex)
-            {
-                GlacierDiagnostics.LogDebug($"[Glacier.Serve] ContinuousBatchEngine loop task shutdown: {ex.Message}");
-            }
-            _cts.Dispose();
-            _runner.Dispose();
-            _pool.Dispose();
-            _gguf.Dispose();
+            _loopTask.Wait(2000);
         }
+        catch (Exception ex)
+        {
+            GlacierDiagnostics.LogDebug($"[Glacier.Serve] ContinuousBatchEngine loop task shutdown: {ex.Message}");
+        }
+
+        if (_loopTask.IsCompleted)
+        {
+            DisposeOwnedResources();
+        }
+        else
+        {
+            _ = _loopTask.ContinueWith(
+                _ => DisposeOwnedResources(),
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+    }
+
+    private void DisposeOwnedResources()
+    {
+        _cts.Dispose();
+        while (_mtpPool.TryPop(out var mtp))
+        {
+            mtp.Dispose();
+        }
+        _hiddenHistoryPool.Clear();
+        _promptLookupProvider.Dispose();
+        _runner.Dispose();
+        _pool.Dispose();
+        _gguf.Dispose();
     }
 }

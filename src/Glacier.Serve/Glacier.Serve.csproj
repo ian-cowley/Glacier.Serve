@@ -12,7 +12,7 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Serve</PackageId>
-    <Version>1.7.0</Version>
+    <Version>1.8.0</Version>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
     <Description>Ultra-low-latency, Native AOT web and LLM inference microservices engine for .NET 10. Features PagedAttention, Continuous Iteration Batching, SIMD HTTP delimiter scanning, zero-allocation Radix Tree routing, Glacier.Storage Arrow streaming, direct Polaris/Tensor streaming, and Autonomous Sleep Consolidation Daemons.</Description>
@@ -22,7 +22,7 @@
     <RepositoryType>git</RepositoryType>
     <PackageTags>http;web;api;vllm;ollama;paged-attention;continuous-batching;llm;inference;simd;radix-tree;arrow-ipc;storage;net10;aot;glacier;continual-learning;sleep</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <PackageReleaseNotes>v1.4.0: Introduces AutonomousSleepDaemon for autonomous wake-sleep consolidation life-cycle management (arXiv:2606.03979). Continuously tracks inference request quiescence, schedules sleep consolidation upon token idle thresholds, triggers offline MoE parameter expansion and GKD knowledge distillation, prunes volatile continuum memory buffers, and seamlessly transitions back to serving without downtime. Updates Glacier.Inference to v1.5.0 and Glacier.Tune to v1.1.0.</PackageReleaseNotes>
+    <PackageReleaseNotes>v1.8.0: Promotes SleepMemoryService (MapSleepMemory /api/sleep/*) and OS-sandboxed PeerBounceService (MapPeerBounce /api/bounce/* via Glacier.Agent.Sandbox) into Glacier.Serve; adds ReasoningBudgetPolicy multi-token &lt;think&gt; enforcement, OpenAI parity fields, runtime LoRA hot-loading/routing, Q4_0/Q8_0 quantized PagedAttention KV cache, and bandwidth-aware speculative decoding. Aligns Glacier.Inference v1.8.0, Glacier.Tune v1.4.0, Glacier.MemEx v1.2.0, and Glacier.Agent v1.5.0.</PackageReleaseNotes>
     <IsAotCompatible>true</IsAotCompatible>
     <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
@@ -47,11 +47,21 @@
     <ProjectReference Include="../../../Glacier.Polaris/src/Glacier.Polaris/Glacier.Polaris.csproj" />
     <ProjectReference Include="../../../Glacier.Inference/src/Glacier.Inference/Glacier.Inference.csproj" />
     <ProjectReference Include="../../../Glacier.Tune/src/Glacier.Tune/Glacier.Tune.csproj" Condition="Exists('../../../Glacier.Tune/src/Glacier.Tune/Glacier.Tune.csproj')" />
+    <ProjectReference Include="../../../Glacier.MemEx/src/Glacier.MemEx/Glacier.MemEx.csproj" Condition="Exists('../../../Glacier.MemEx/src/Glacier.MemEx/Glacier.MemEx.csproj')" />
+    <ProjectReference Include="../../../Glacier.Agent/src/Glacier.Agent/Glacier.Agent.csproj" Condition="Exists('../../../Glacier.Agent/src/Glacier.Agent/Glacier.Agent.csproj')" />
   </ItemGroup>
   <ItemGroup Condition="!Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') or '$(UseLocalProjectReferences)' == 'false'">
     <PackageReference Include="Glacier.Formats" Version="1.0.0" />
     <PackageReference Include="Glacier.Polaris" Version="1.2.0" />
     <PackageReference Include="Glacier.Inference" Version="1.8.0" />
     <PackageReference Include="Glacier.Tune" Version="1.4.0" />
+    <PackageReference Include="Glacier.MemEx" Version="1.2.0" />
+    <PackageReference Include="Glacier.Agent" Version="1.5.0" />
+  </ItemGroup>
+  <ItemGroup Condition="Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') and '$(UseLocalProjectReferences)' != 'false' and !Exists('../../../Glacier.MemEx/src/Glacier.MemEx/Glacier.MemEx.csproj')">
+    <PackageReference Include="Glacier.MemEx" Version="1.2.0" />
+  </ItemGroup>
+  <ItemGroup Condition="Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') and '$(UseLocalProjectReferences)' != 'false' and !Exists('../../../Glacier.Agent/src/Glacier.Agent/Glacier.Agent.csproj')">
+    <PackageReference Include="Glacier.Agent" Version="1.5.0" />
   </ItemGroup>
 </Project>

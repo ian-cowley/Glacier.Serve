@@ -143,6 +143,100 @@ public sealed class SleepTriggerResponse
     [JsonPropertyName("synaptic_pruning_succeeded")] public bool SynapticPruningSucceeded { get; set; }
 }
 
+/// <summary>
+/// AOT-safe status payload for <c>GET /api/sleep/status</c> and <c>POST /api/sleep/trigger</c>.
+/// </summary>
+public sealed class SleepMemoryStatusResponse
+{
+    [JsonPropertyName("enabled")] public bool Enabled { get; init; }
+    [JsonPropertyName("token_budget")] public int TokenBudget { get; init; }
+    [JsonPropertyName("state")] public required string State { get; init; }
+    [JsonPropertyName("raw_chunks")] public int RawChunks { get; init; }
+    [JsonPropertyName("retained_traces")] public int RetainedTraces { get; init; }
+    [JsonPropertyName("pruned_chunks")] public int PrunedChunks { get; init; }
+    [JsonPropertyName("sleep_cycles")] public int SleepCycles { get; init; }
+    [JsonPropertyName("dreams_consolidated")] public int DreamsConsolidated { get; init; }
+    [JsonPropertyName("pending_dreams")] public int PendingDreams { get; init; }
+    [JsonPropertyName("last_selected_traces")] public int LastSelectedTraces { get; init; }
+    [JsonPropertyName("last_packed_tokens")] public int LastPackedTokens { get; init; }
+    [JsonPropertyName("last_elapsed_ms")] public double LastElapsedMs { get; init; }
+}
+
+/// <summary>
+/// AOT-safe status payload for <c>GET /api/bounce/status</c>.
+/// </summary>
+public sealed class BounceStatusResponse
+{
+    [JsonPropertyName("primary_endpoint")] public required string PrimaryEndpoint { get; init; }
+    [JsonPropertyName("critic_endpoint")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? CriticEndpoint { get; init; }
+    [JsonPropertyName("compiler_bounce_enabled")] public bool CompilerBounceEnabled { get; init; }
+    [JsonPropertyName("max_repairs")] public int MaxRepairs { get; init; }
+    [JsonPropertyName("total_requests")] public long TotalRequests { get; init; }
+    [JsonPropertyName("bypassed_requests")] public long BypassedRequests { get; init; }
+    [JsonPropertyName("critic_assisted_requests")] public long CriticAssistedRequests { get; init; }
+    [JsonPropertyName("critic_fallbacks")] public long CriticFallbacks { get; init; }
+    [JsonPropertyName("verifier_checks")] public long VerifierChecks { get; init; }
+    [JsonPropertyName("verifier_first_pass_ok")] public long VerifierFirstPassOk { get; init; }
+    [JsonPropertyName("repair_attempts")] public long RepairAttempts { get; init; }
+    [JsonPropertyName("repairs_succeeded")] public long RepairsSucceeded { get; init; }
+}
+
+/// <summary>
+/// Outbound AOT-safe chat payload used by <c>PeerBounceService</c>.
+/// </summary>
+public sealed class BounceChatPayload
+{
+    [JsonPropertyName("model")] public required string Model { get; init; }
+    [JsonPropertyName("messages")] public required ChatMessage[] Messages { get; init; }
+    [JsonPropertyName("temperature")] public double Temperature { get; init; }
+    [JsonPropertyName("max_tokens")] public int MaxTokens { get; init; }
+    [JsonPropertyName("stream")] public bool Stream { get; init; }
+    [JsonPropertyName("chat_template_kwargs")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ChatTemplateKwargs? ChatTemplateKwargs { get; init; }
+}
+
+/// <summary>
+/// Inbound AOT-safe request payload for <c>MapPeerBounce</c> chat endpoints with bounce-appropriate defaults.
+/// </summary>
+public sealed class BounceChatRequest
+{
+    [JsonPropertyName("model")] public string? Model { get; set; }
+    [JsonPropertyName("messages")] public List<ChatMessage>? Messages { get; set; }
+    [JsonPropertyName("temperature")] public double Temperature { get; set; } = 0.0;
+    [JsonPropertyName("max_tokens")] public int MaxTokens { get; set; } = 1024;
+    [JsonPropertyName("stream")] public bool Stream { get; set; }
+}
+
+public sealed class ChatCompletionChunkResponse
+{
+    [JsonPropertyName("id")] public required string Id { get; init; }
+    [JsonPropertyName("object")] public string Object { get; init; } = "chat.completion.chunk";
+    [JsonPropertyName("created")] public long Created { get; init; }
+    [JsonPropertyName("model")] public required string Model { get; init; }
+    [JsonPropertyName("choices")] public required ChatChunkChoice[] Choices { get; init; }
+}
+
+public sealed class ChatChunkChoice
+{
+    [JsonPropertyName("index")] public int Index { get; init; }
+    [JsonPropertyName("delta")] public required ChatChunkDelta Delta { get; init; }
+    [JsonPropertyName("finish_reason")] public string? FinishReason { get; init; }
+}
+
+public sealed class ChatChunkDelta
+{
+    [JsonPropertyName("role")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Role { get; init; }
+
+    [JsonPropertyName("content")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Content { get; init; }
+}
+
 public sealed class TensorDto
 {
     [JsonPropertyName("rank")] public int Rank { get; set; }
@@ -159,6 +253,8 @@ public sealed class TensorDto
 [JsonSerializable(typeof(InferenceRequest))]
 [JsonSerializable(typeof(OllamaOptions))]
 [JsonSerializable(typeof(ChatMessage))]
+[JsonSerializable(typeof(ChatTemplateKwargs))]
+[JsonSerializable(typeof(StreamOptions))]
 [JsonSerializable(typeof(ChatCompletionResponse))]
 [JsonSerializable(typeof(ChatChoice))]
 [JsonSerializable(typeof(CompletionResponse))]
@@ -176,6 +272,13 @@ public sealed class TensorDto
 [JsonSerializable(typeof(HealthCheckResponse))]
 [JsonSerializable(typeof(SleepStatusResponse))]
 [JsonSerializable(typeof(SleepTriggerResponse))]
+[JsonSerializable(typeof(SleepMemoryStatusResponse))]
+[JsonSerializable(typeof(BounceStatusResponse))]
+[JsonSerializable(typeof(BounceChatPayload))]
+[JsonSerializable(typeof(BounceChatRequest))]
+[JsonSerializable(typeof(ChatCompletionChunkResponse))]
+[JsonSerializable(typeof(ChatChunkChoice))]
+[JsonSerializable(typeof(ChatChunkDelta))]
 public partial class ServeJsonContext : JsonSerializerContext
 {
 }

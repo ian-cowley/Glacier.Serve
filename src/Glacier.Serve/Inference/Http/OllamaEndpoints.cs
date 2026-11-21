@@ -27,7 +27,6 @@ public static class OllamaEndpoints
 
             // Ollama defaults stream to true when omitted, and returns a single JSON object when stream: false
             bool stream = req.IsStreamExplicitlySet ? req.Stream : true;
-            string modelName = string.IsNullOrEmpty(req.Model) ? defaultModelName : req.Model;
 
             using var requestCts = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted);
             using var disconnectTimer = OpenAiEndpoints.StartDisconnectMonitor(ctx, requestCts);
@@ -37,15 +36,28 @@ public static class OllamaEndpoints
                 (SequenceState state, IAsyncEnumerable<string> tokenStream) enqueued;
                 try
                 {
-                    enqueued = await engine.EnqueueAsync(req, requestCts.Token);
+                    enqueued = await engine.EnqueueAsync(req, defaultModelName, requestCts.Token);
                 }
                 catch (ArgumentOutOfRangeException ex)
                 {
                     await WriteBadRequestAsync(ctx.Response, ex.Message);
                     return;
                 }
+                catch (ArgumentException ex)
+                {
+                    await WriteBadRequestAsync(ctx.Response, ex.Message);
+                    return;
+                }
+                catch (KeyNotFoundException ex)
+                {
+                    await WriteNotFoundAsync(ctx.Response, ex.Message);
+                    return;
+                }
 
                 var (state, tokenStream) = enqueued;
+                string modelName = !string.IsNullOrEmpty(req.Model)
+                    ? req.Model
+                    : (!string.IsNullOrEmpty(state.LoraAdapterName) ? $"{defaultModelName}:{state.LoraAdapterName}" : defaultModelName);
 
                 if (!stream)
                 {
@@ -118,7 +130,6 @@ public static class OllamaEndpoints
             }
 
             bool stream = req.IsStreamExplicitlySet ? req.Stream : true;
-            string modelName = string.IsNullOrEmpty(req.Model) ? defaultModelName : req.Model;
 
             using var requestCts = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted);
             using var disconnectTimer = OpenAiEndpoints.StartDisconnectMonitor(ctx, requestCts);
@@ -128,15 +139,28 @@ public static class OllamaEndpoints
                 (SequenceState state, IAsyncEnumerable<string> tokenStream) enqueued;
                 try
                 {
-                    enqueued = await engine.EnqueueAsync(req, requestCts.Token);
+                    enqueued = await engine.EnqueueAsync(req, defaultModelName, requestCts.Token);
                 }
                 catch (ArgumentOutOfRangeException ex)
                 {
                     await WriteBadRequestAsync(ctx.Response, ex.Message);
                     return;
                 }
+                catch (ArgumentException ex)
+                {
+                    await WriteBadRequestAsync(ctx.Response, ex.Message);
+                    return;
+                }
+                catch (KeyNotFoundException ex)
+                {
+                    await WriteNotFoundAsync(ctx.Response, ex.Message);
+                    return;
+                }
 
                 var (state, tokenStream) = enqueued;
+                string modelName = !string.IsNullOrEmpty(req.Model)
+                    ? req.Model
+                    : (!string.IsNullOrEmpty(state.LoraAdapterName) ? $"{defaultModelName}:{state.LoraAdapterName}" : defaultModelName);
 
                 if (!stream)
                 {
@@ -201,18 +225,33 @@ public static class OllamaEndpoints
         // GET /api/tags
         app.MapGet("/api/tags", async ctx =>
         {
+            string modifiedAt = DateTimeOffset.UtcNow.ToString("o");
+            var adapters = engine.GetLoadedLoraAdapters();
+            var models = new List<OllamaModelItem>(1 + adapters.Count)
+            {
+                new OllamaModelItem
+                {
+                    Name = defaultModelName,
+                    Model = defaultModelName,
+                    ModifiedAt = modifiedAt,
+                    Size = 4680000000L
+                }
+            };
+            for (int i = 0; i < adapters.Count; i++)
+            {
+                string composite = $"{defaultModelName}:{adapters[i]}";
+                models.Add(new OllamaModelItem
+                {
+                    Name = composite,
+                    Model = composite,
+                    ModifiedAt = modifiedAt,
+                    Size = 4680000000L
+                });
+            }
+
             var res = new OllamaTagsResponse
             {
-                Models =
-                [
-                    new OllamaModelItem
-                    {
-                        Name = defaultModelName,
-                        Model = defaultModelName,
-                        ModifiedAt = DateTimeOffset.UtcNow.ToString("o"),
-                        Size = 4680000000L
-                    }
-                ]
+                Models = models
             };
             await ctx.Response.WriteJsonAsync(res, ServeJsonContext.Default.OllamaTagsResponse, ctx.RequestAborted);
         });
@@ -227,6 +266,20 @@ public static class OllamaEndpoints
             {
                 Message = message,
                 Type = "invalid_request_error"
+            }
+        };
+        return response.WriteJsonAsync(err, ServeJsonContext.Default.ApiErrorResponse);
+    }
+
+    private static ValueTask WriteNotFoundAsync(HttpResponse response, string message)
+    {
+        response.StatusCode = 404;
+        var err = new ApiErrorResponse
+        {
+            Error = new ApiErrorDetail
+            {
+                Message = message,
+                Type = "model_not_found"
             }
         };
         return response.WriteJsonAsync(err, ServeJsonContext.Default.ApiErrorResponse);

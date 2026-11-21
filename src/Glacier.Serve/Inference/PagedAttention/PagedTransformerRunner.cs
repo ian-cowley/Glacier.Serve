@@ -13,7 +13,7 @@ namespace Glacier.Serve.Inference.PagedAttention;
 /// Holds per-runner activation scratch buffers and evaluates single-token,
 /// causal batched prefill chunks, and multi-sequence decode steps using virtual block tables.
 /// </summary>
-public sealed unsafe class PagedTransformerRunner : IPagedModelRunner
+public sealed unsafe class PagedTransformerRunner : IPagedModelRunner, IHiddenStateSource, IPagedHiddenStateContext
 {
     private readonly ModelWeights _weights;
     private readonly int _dim;
@@ -60,14 +60,88 @@ public sealed unsafe class PagedTransformerRunner : IPagedModelRunner
     private readonly float* _gateSumsBatch;
     private readonly float* _ffnProjBatch;
 
+    private bool _historyEnabled;
+    private float[]? _defaultHiddenHistory;
+    private float[]? _boundHiddenHistory;
+    private IReadOnlyList<float[]?>? _boundBatchHistories;
     private bool _disposed;
 
     public bool IsGpuAccelerated => false;
     public string BackendName => "CPU-SIMD";
     public ModelWeights Weights => _weights;
+    public int HiddenDim => _dim;
     public int VocabSize => _vocabSize;
     public int MaxSeqLen => _maxSeqLen;
     public int MaxBatchSize => _maxBatchSize;
+    public bool SupportsHiddenStateCapture => true;
+
+    bool IPagedHiddenStateContext.SupportsHiddenStateCapture(LoraAdapterWeights? lora) => true;
+
+    internal void BindHiddenStateHistory(float[]? history) => _boundHiddenHistory = history;
+
+    internal void BindBatchHiddenStateHistories(IReadOnlyList<float[]?>? histories) => _boundBatchHistories = histories;
+
+    void IPagedHiddenStateContext.BindHiddenStateHistory(float[]? history) => BindHiddenStateHistory(history);
+
+    void IPagedHiddenStateContext.BindBatchHiddenStateHistories(IReadOnlyList<float[]?>? histories) => BindBatchHiddenStateHistories(histories);
+
+    public ReadOnlySpan<float> GetLastHiddenState()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        return new ReadOnlySpan<float>(_x, _dim);
+    }
+
+    public void CopyTokenEmbedding(int tokenId, Span<float> destination)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (destination.Length < _dim)
+            throw new ArgumentException($"Destination span too small ({destination.Length} < {_dim}).", nameof(destination));
+        if (_weights.EmbdWeight == null)
+            throw new InvalidOperationException("Model has no token_embd.weight pointer.");
+        fixed (float* pDst = destination)
+        {
+            QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, tokenId, pDst, _dim);
+        }
+    }
+
+    public void EnablePositionHistory()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _historyEnabled = true;
+        _defaultHiddenHistory ??= new float[checked(_maxSeqLen * _dim)];
+    }
+
+    public bool TryGetHiddenStateAt(int position, Span<float> destination)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        float[]? hist = _boundHiddenHistory ?? _defaultHiddenHistory;
+        if (!_historyEnabled || hist == null || (uint)position >= (uint)_maxSeqLen || destination.Length < _dim)
+            return false;
+
+        int offset = position * _dim;
+        if (offset + _dim > hist.Length)
+            return false;
+
+        hist.AsSpan(offset, _dim).CopyTo(destination);
+        return true;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void RecordHiddenState(int pos, float* src, float[]? targetOverride = null)
+    {
+        if (!_historyEnabled || (uint)pos >= (uint)_maxSeqLen)
+            return;
+
+        float[]? hist = targetOverride ?? _boundHiddenHistory ?? _defaultHiddenHistory;
+        if (hist == null)
+            return;
+
+        int offset = pos * _dim;
+        if (offset + _dim <= hist.Length)
+        {
+            new ReadOnlySpan<float>(src, _dim).CopyTo(hist.AsSpan(offset, _dim));
+        }
+    }
 
     public PagedTransformerRunner(ModelWeights weights, int maxSeqLen = 4096, int maxBatchSize = 64)
     {
@@ -199,7 +273,18 @@ public sealed unsafe class PagedTransformerRunner : IPagedModelRunner
         BlockTable blockTable,
         PagedBlockPool pool,
         Span<float> logits,
-        bool computeLogits = true)
+        bool computeLogits = true) =>
+        ForwardToken(token, pos, blockTable, pool, logits, computeLogits, lora: null);
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public bool ForwardToken(
+        int token,
+        int pos,
+        BlockTable blockTable,
+        PagedBlockPool pool,
+        Span<float> logits,
+        bool computeLogits,
+        LoraAdapterWeights? lora)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (pos < 0 || pos >= _maxSeqLen)
@@ -246,6 +331,13 @@ public sealed unsafe class PagedTransformerRunner : IPagedModelRunner
             if (layer.KBias != null) AddVector(_k, layer.KBias, kvDim);
             if (layer.VBias != null) AddVector(_v, layer.VBias, vDim);
 
+            if (lora != null)
+            {
+                lora.Apply(l, LoraProjection.Q, _normX, _q, _dim, qDim);
+                lora.Apply(l, LoraProjection.K, _normX, _k, _dim, kvDim);
+                lora.Apply(l, LoraProjection.V, _normX, _v, _dim, vDim);
+            }
+
             // Per-head QK RMSNorm (Qwen3 / Gemma3 / DeepSeek-R1-Qwen3)
             ApplyQkNorm(layer, _q, _k);
 
@@ -288,6 +380,7 @@ public sealed unsafe class PagedTransformerRunner : IPagedModelRunner
             // Attention out projection (uses outDim = _nHeads * _vHeadDim)
             QuantKernels.ComputeBlockSums32(_attnOut, _attnOutSums, outDim);
             QuantKernels.MatVecMul(layer.AttnOutType, layer.AttnOutWeight, _attnOut, _attnProj, outDim, _dim, _attnOutSums);
+            lora?.Apply(l, LoraProjection.AttnOut, _attnOut, _attnProj, outDim, _dim);
             if (layer.AttnOutBias != null) AddVector(_attnProj, layer.AttnOutBias, _dim);
             AddVector(_x, _attnProj, _dim);
 
@@ -298,13 +391,20 @@ public sealed unsafe class PagedTransformerRunner : IPagedModelRunner
             // SwiGLU FFN
             QuantKernels.MatVecMul(layer.FfnGateType, layer.FfnGateWeight, _normX, _gate, _dim, _ffnDim, _normXSums);
             QuantKernels.MatVecMul(layer.FfnUpType, layer.FfnUpWeight, _normX, _up, _dim, _ffnDim, _normXSums);
+            if (lora != null)
+            {
+                lora.Apply(l, LoraProjection.Gate, _normX, _gate, _dim, _ffnDim);
+                lora.Apply(l, LoraProjection.Up, _normX, _up, _dim, _ffnDim);
+            }
             QuantKernels.SwiGLU(_gate, _up, _gate, _ffnDim);
             QuantKernels.ComputeBlockSums32(_gate, _gateSums, _ffnDim);
             QuantKernels.MatVecMul(layer.FfnDownType, layer.FfnDownWeight, _gate, _ffnProj, _ffnDim, _dim, _gateSums);
+            lora?.Apply(l, LoraProjection.Down, _gate, _ffnProj, _ffnDim, _dim);
             AddVector(_x, _ffnProj, _dim);
         }
 
-        // 3. Compute final logits if requested
+        // 3. Record pre-OutNorm hidden state and compute final logits if requested
+        RecordHiddenState(pos, _x);
         if (computeLogits && !logits.IsEmpty)
         {
             QuantKernels.RMSNorm(_x, _weights.OutNormWeight, _normX, _dim, _weights.RmsNormEps);
@@ -326,7 +426,18 @@ public sealed unsafe class PagedTransformerRunner : IPagedModelRunner
         BlockTable blockTable,
         PagedBlockPool pool,
         Span<float> logits,
-        bool computeLogits = true)
+        bool computeLogits = true) =>
+        ForwardPrefillChunk(tokens, startPos, blockTable, pool, logits, computeLogits, lora: null);
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public bool ForwardPrefillChunk(
+        ReadOnlySpan<int> tokens,
+        int startPos,
+        BlockTable blockTable,
+        PagedBlockPool pool,
+        Span<float> logits,
+        bool computeLogits,
+        LoraAdapterWeights? lora)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (tokens.IsEmpty) return true;
@@ -334,7 +445,7 @@ public sealed unsafe class PagedTransformerRunner : IPagedModelRunner
             throw new ArgumentOutOfRangeException(nameof(startPos), startPos, $"Prefill chunk [{startPos}, {startPos + tokens.Length}) exceeds maxSeqLen {_maxSeqLen}.");
 
         if (tokens.Length == 1)
-            return ForwardToken(tokens[0], startPos, blockTable, pool, logits, computeLogits);
+            return ForwardToken(tokens[0], startPos, blockTable, pool, logits, computeLogits, lora);
 
         int total = tokens.Length;
         int offset = 0;
@@ -348,8 +459,59 @@ public sealed unsafe class PagedTransformerRunner : IPagedModelRunner
                 blockTable,
                 pool,
                 isLastSubChunk && computeLogits ? logits : Span<float>.Empty,
-                isLastSubChunk && computeLogits))
+                isLastSubChunk && computeLogits,
+                lora))
             {
+                return false;
+            }
+            offset += chunkLen;
+        }
+
+        return true;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public bool VerifyDraftChunk(
+        ReadOnlySpan<int> tokens,
+        int startPos,
+        BlockTable blockTable,
+        PagedBlockPool pool,
+        Span<float> logitsOut) =>
+        VerifyDraftChunk(tokens, startPos, blockTable, pool, logitsOut, lora: null);
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public bool VerifyDraftChunk(
+        ReadOnlySpan<int> tokens,
+        int startPos,
+        BlockTable blockTable,
+        PagedBlockPool pool,
+        Span<float> logitsOut,
+        LoraAdapterWeights? lora)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (tokens.IsEmpty) return true;
+        if (startPos < 0 || startPos + tokens.Length > _maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(startPos), startPos, $"Draft verify chunk [{startPos}, {startPos + tokens.Length}) exceeds maxSeqLen {_maxSeqLen}.");
+        if (logitsOut.Length < tokens.Length * _vocabSize)
+            throw new ArgumentException($"logitsOut too small ({logitsOut.Length} < {tokens.Length * _vocabSize}).", nameof(logitsOut));
+
+        int initialTokens = blockTable.TokenCount;
+        int total = tokens.Length;
+        int offset = 0;
+        while (offset < total)
+        {
+            int chunkLen = Math.Min(total - offset, _maxBatchSize);
+            if (!ForwardPrefillSubBatch(
+                tokens.Slice(offset, chunkLen),
+                startPos + offset,
+                blockTable,
+                pool,
+                logitsOut.Slice(offset * _vocabSize, chunkLen * _vocabSize),
+                computeLogits: true,
+                lora,
+                computeAllLogits: true))
+            {
+                blockTable.TruncateTo(initialTokens);
                 return false;
             }
             offset += chunkLen;
@@ -365,7 +527,9 @@ public sealed unsafe class PagedTransformerRunner : IPagedModelRunner
         BlockTable blockTable,
         PagedBlockPool pool,
         Span<float> logits,
-        bool computeLogits)
+        bool computeLogits,
+        LoraAdapterWeights? lora,
+        bool computeAllLogits = false)
     {
         int batchSize = chunkTokens.Length;
         int qDim = _nHeads * _headDim;
@@ -391,6 +555,10 @@ public sealed unsafe class PagedTransformerRunner : IPagedModelRunner
                 }
                 pBlockIds[t] = blockId;
                 offsetsInBlock[t] = offset;
+            }
+            else if (pos > blockTable.TokenCount)
+            {
+                throw new ArgumentOutOfRangeException(nameof(chunkStartPos), pos, $"Cannot evaluate non-contiguous position {pos} when BlockTable has {blockTable.TokenCount} tokens.");
             }
             else
             {
@@ -424,6 +592,7 @@ public sealed unsafe class PagedTransformerRunner : IPagedModelRunner
             // Store all K/V for this layer first, then compute causal attention (bounded by pos + 1)
             for (int t = 0; t < batchSize; t++)
             {
+                float* normXPtr = _normXBatch + t * _dim;
                 float* qPtr = _qBatch + t * qDim;
                 float* kPtr = _kBatch + t * kvDim;
                 float* vPtr = _vBatch + t * vDim;
@@ -431,6 +600,13 @@ public sealed unsafe class PagedTransformerRunner : IPagedModelRunner
                 if (layer.QBias != null) AddVector(qPtr, layer.QBias, qDim);
                 if (layer.KBias != null) AddVector(kPtr, layer.KBias, kvDim);
                 if (layer.VBias != null) AddVector(vPtr, layer.VBias, vDim);
+
+                if (lora != null)
+                {
+                    lora.Apply(l, LoraProjection.Q, normXPtr, qPtr, _dim, qDim);
+                    lora.Apply(l, LoraProjection.K, normXPtr, kPtr, _dim, kvDim);
+                    lora.Apply(l, LoraProjection.V, normXPtr, vPtr, _dim, vDim);
+                }
 
                 ApplyQkNorm(layer, qPtr, kPtr);
 
@@ -477,8 +653,10 @@ public sealed unsafe class PagedTransformerRunner : IPagedModelRunner
 
             for (int t = 0; t < batchSize; t++)
             {
-                if (layer.AttnOutBias != null) AddVector(_attnProjBatch + t * _dim, layer.AttnOutBias, _dim);
-                AddVector(_xBatch + t * _dim, _attnProjBatch + t * _dim, _dim);
+                float* attnProjPtr = _attnProjBatch + t * _dim;
+                lora?.Apply(l, LoraProjection.AttnOut, _attnOutBatch + t * outDim, attnProjPtr, outDim, _dim);
+                if (layer.AttnOutBias != null) AddVector(attnProjPtr, layer.AttnOutBias, _dim);
+                AddVector(_xBatch + t * _dim, attnProjPtr, _dim);
 
                 QuantKernels.RMSNorm(_xBatch + t * _dim, layer.FfnNormWeight, _normXBatch + t * _dim, _dim, _weights.RmsNormEps);
                 QuantKernels.ComputeBlockSums32(_normXBatch + t * _dim, _normXSumsBatch + t * sumsDim, _dim);
@@ -489,28 +667,63 @@ public sealed unsafe class PagedTransformerRunner : IPagedModelRunner
 
             for (int t = 0; t < batchSize; t++)
             {
-                QuantKernels.SwiGLU(_gateBatch + t * _ffnDim, _upBatch + t * _ffnDim, _gateBatch + t * _ffnDim, _ffnDim);
-                QuantKernels.ComputeBlockSums32(_gateBatch + t * _ffnDim, _gateSumsBatch + t * gateSumsDim, _ffnDim);
+                float* normXPtr = _normXBatch + t * _dim;
+                float* gatePtr = _gateBatch + t * _ffnDim;
+                float* upPtr = _upBatch + t * _ffnDim;
+                if (lora != null)
+                {
+                    lora.Apply(l, LoraProjection.Gate, normXPtr, gatePtr, _dim, _ffnDim);
+                    lora.Apply(l, LoraProjection.Up, normXPtr, upPtr, _dim, _ffnDim);
+                }
+                QuantKernels.SwiGLU(gatePtr, upPtr, gatePtr, _ffnDim);
+                QuantKernels.ComputeBlockSums32(gatePtr, _gateSumsBatch + t * gateSumsDim, _ffnDim);
             }
 
             QuantKernels.MatMulBatch(layer.FfnDownType, layer.FfnDownWeight, _gateBatch, _ffnProjBatch, _ffnDim, _dim, batchSize, _gateSumsBatch);
 
             for (int t = 0; t < batchSize; t++)
             {
-                AddVector(_xBatch + t * _dim, _ffnProjBatch + t * _dim, _dim);
+                float* ffnProjPtr = _ffnProjBatch + t * _dim;
+                lora?.Apply(l, LoraProjection.Down, _gateBatch + t * _ffnDim, ffnProjPtr, _ffnDim, _dim);
+                AddVector(_xBatch + t * _dim, ffnProjPtr, _dim);
             }
         }
 
-        // 4. Compute logits only for the final token of the prefill chunk
+        // 4. Record pre-OutNorm hidden states and compute logits
+        Buffer.MemoryCopy(_xBatch + (batchSize - 1) * _dim, _x, (nuint)_dim * sizeof(float), (nuint)_dim * sizeof(float));
+        if (_historyEnabled)
+        {
+            for (int t = 0; t < batchSize; t++)
+            {
+                RecordHiddenState(chunkStartPos + t, _xBatch + t * _dim);
+            }
+        }
+
         if (computeLogits && !logits.IsEmpty)
         {
-            float* lastX = _xBatch + (batchSize - 1) * _dim;
-            QuantKernels.RMSNorm(lastX, _weights.OutNormWeight, _normX, _dim, _weights.RmsNormEps);
-            QuantKernels.ComputeBlockSums32(_normX, _normXSums, _dim);
-
-            fixed (float* pLogits = logits)
+            if (computeAllLogits)
             {
-                QuantKernels.MatVecMul(_weights.OutType, _weights.OutWeight, _normX, pLogits, _dim, _vocabSize, _normXSums);
+                for (int t = 0; t < batchSize; t++)
+                {
+                    QuantKernels.RMSNorm(_xBatch + t * _dim, _weights.OutNormWeight, _normXBatch + t * _dim, _dim, _weights.RmsNormEps);
+                    QuantKernels.ComputeBlockSums32(_normXBatch + t * _dim, _normXSumsBatch + t * sumsDim, _dim);
+                }
+
+                fixed (float* pLogits = logits)
+                {
+                    QuantKernels.MatMulBatch(_weights.OutType, _weights.OutWeight, _normXBatch, pLogits, _dim, _vocabSize, batchSize, _normXSumsBatch);
+                }
+            }
+            else
+            {
+                float* lastX = _xBatch + (batchSize - 1) * _dim;
+                QuantKernels.RMSNorm(lastX, _weights.OutNormWeight, _normX, _dim, _weights.RmsNormEps);
+                QuantKernels.ComputeBlockSums32(_normX, _normXSums, _dim);
+
+                fixed (float* pLogits = logits)
+                {
+                    QuantKernels.MatVecMul(_weights.OutType, _weights.OutWeight, _normX, pLogits, _dim, _vocabSize, _normXSums);
+                }
             }
         }
 
@@ -525,13 +738,27 @@ public sealed unsafe class PagedTransformerRunner : IPagedModelRunner
         PagedBlockPool pool,
         Span<float> logitsBatch,
         Span<bool> successFlags,
-        bool computeLogits = true)
+        bool computeLogits = true) =>
+        ForwardBatch(tokens, positions, blockTables, pool, logitsBatch, successFlags, computeLogits, loras: null);
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public bool ForwardBatch(
+        ReadOnlySpan<int> tokens,
+        ReadOnlySpan<int> positions,
+        IReadOnlyList<BlockTable> blockTables,
+        PagedBlockPool pool,
+        Span<float> logitsBatch,
+        Span<bool> successFlags,
+        bool computeLogits,
+        IReadOnlyList<LoraAdapterWeights?>? loras)
     {
         int batchSize = tokens.Length;
         if (batchSize == 0) return true;
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (batchSize > _maxBatchSize)
             throw new ArgumentOutOfRangeException(nameof(tokens), $"Batch size {batchSize} exceeds maximum runner capacity {_maxBatchSize}.");
+        if (loras != null && loras.Count < batchSize)
+            throw new ArgumentException($"LoRA adapter list length ({loras.Count}) must be at least batch size ({batchSize}).", nameof(loras));
 
         for (int b = 0; b < batchSize; b++)
         {
@@ -605,6 +832,7 @@ public sealed unsafe class PagedTransformerRunner : IPagedModelRunner
             for (int b = 0; b < batchSize; b++)
             {
                 if (!successFlags[b]) continue;
+                float* normXPtr = _normXBatch + b * _dim;
                 float* qPtr = _qBatch + b * qDim;
                 float* kPtr = _kBatch + b * kvDim;
                 float* vPtr = _vBatch + b * vDim;
@@ -612,6 +840,14 @@ public sealed unsafe class PagedTransformerRunner : IPagedModelRunner
                 if (layer.QBias != null) AddVector(qPtr, layer.QBias, qDim);
                 if (layer.KBias != null) AddVector(kPtr, layer.KBias, kvDim);
                 if (layer.VBias != null) AddVector(vPtr, layer.VBias, vDim);
+
+                LoraAdapterWeights? seqLora = loras?[b];
+                if (seqLora != null)
+                {
+                    seqLora.Apply(l, LoraProjection.Q, normXPtr, qPtr, _dim, qDim);
+                    seqLora.Apply(l, LoraProjection.K, normXPtr, kPtr, _dim, kvDim);
+                    seqLora.Apply(l, LoraProjection.V, normXPtr, vPtr, _dim, vDim);
+                }
 
                 // Per-head QK RMSNorm
                 ApplyQkNorm(layer, qPtr, kPtr);
@@ -661,8 +897,10 @@ public sealed unsafe class PagedTransformerRunner : IPagedModelRunner
             for (int b = 0; b < batchSize; b++)
             {
                 if (!successFlags[b]) continue;
-                if (layer.AttnOutBias != null) AddVector(_attnProjBatch + b * _dim, layer.AttnOutBias, _dim);
-                AddVector(_xBatch + b * _dim, _attnProjBatch + b * _dim, _dim);
+                float* attnProjPtr = _attnProjBatch + b * _dim;
+                loras?[b]?.Apply(l, LoraProjection.AttnOut, _attnOutBatch + b * outDim, attnProjPtr, outDim, _dim);
+                if (layer.AttnOutBias != null) AddVector(attnProjPtr, layer.AttnOutBias, _dim);
+                AddVector(_xBatch + b * _dim, attnProjPtr, _dim);
 
                 // FFN pre-norm
                 QuantKernels.RMSNorm(_xBatch + b * _dim, layer.FfnNormWeight, _normXBatch + b * _dim, _dim, _weights.RmsNormEps);
@@ -676,8 +914,17 @@ public sealed unsafe class PagedTransformerRunner : IPagedModelRunner
             for (int b = 0; b < batchSize; b++)
             {
                 if (!successFlags[b]) continue;
-                QuantKernels.SwiGLU(_gateBatch + b * _ffnDim, _upBatch + b * _ffnDim, _gateBatch + b * _ffnDim, _ffnDim);
-                QuantKernels.ComputeBlockSums32(_gateBatch + b * _ffnDim, _gateSumsBatch + b * gateSumsDim, _ffnDim);
+                float* normXPtr = _normXBatch + b * _dim;
+                float* gatePtr = _gateBatch + b * _ffnDim;
+                float* upPtr = _upBatch + b * _ffnDim;
+                LoraAdapterWeights? seqLora = loras?[b];
+                if (seqLora != null)
+                {
+                    seqLora.Apply(l, LoraProjection.Gate, normXPtr, gatePtr, _dim, _ffnDim);
+                    seqLora.Apply(l, LoraProjection.Up, normXPtr, upPtr, _dim, _ffnDim);
+                }
+                QuantKernels.SwiGLU(gatePtr, upPtr, gatePtr, _ffnDim);
+                QuantKernels.ComputeBlockSums32(gatePtr, _gateSumsBatch + b * gateSumsDim, _ffnDim);
             }
 
             // Unified Batch GEMM: FFN Down Projection
@@ -686,11 +933,31 @@ public sealed unsafe class PagedTransformerRunner : IPagedModelRunner
             for (int b = 0; b < batchSize; b++)
             {
                 if (!successFlags[b]) continue;
-                AddVector(_xBatch + b * _dim, _ffnProjBatch + b * _dim, _dim);
+                float* ffnProjPtr = _ffnProjBatch + b * _dim;
+                loras?[b]?.Apply(l, LoraProjection.Down, _gateBatch + b * _ffnDim, ffnProjPtr, _ffnDim, _dim);
+                AddVector(_xBatch + b * _dim, ffnProjPtr, _dim);
             }
         }
 
-        // 4. Compute final logits if requested
+        // 4. Record pre-OutNorm hidden states and compute final logits if requested
+        int lastValidBatchIdx = -1;
+        for (int b = 0; b < batchSize; b++)
+        {
+            if (!successFlags[b]) continue;
+            lastValidBatchIdx = b;
+            if (_historyEnabled)
+            {
+                float[]? seqHist = _boundBatchHistories != null && b < _boundBatchHistories.Count
+                    ? _boundBatchHistories[b]
+                    : null;
+                RecordHiddenState(positions[b], _xBatch + b * _dim, seqHist);
+            }
+        }
+        if (lastValidBatchIdx >= 0)
+        {
+            Buffer.MemoryCopy(_xBatch + lastValidBatchIdx * _dim, _x, (nuint)_dim * sizeof(float), (nuint)_dim * sizeof(float));
+        }
+
         if (computeLogits && !logitsBatch.IsEmpty)
         {
             for (int b = 0; b < batchSize; b++)

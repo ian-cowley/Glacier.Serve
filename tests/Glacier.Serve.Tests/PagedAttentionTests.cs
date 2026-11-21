@@ -177,4 +177,54 @@ public unsafe class PagedAttentionTests
 
         table.ReleaseAll();
     }
+
+    [Fact]
+    public void PagedBlockPool_AfterDispose_AllAccessorsAllocatorsAndCowMethodsThrowObjectDisposedException()
+    {
+        var pool = new PagedBlockPool(totalBlocks: 4, layers: 1, headsKv: 1, headDim: 4, blockSize: 4);
+        Assert.True(pool.TryAllocateBlock(out int b0));
+        ulong prefixHash = PagedBlockPool.ComputePrefixHash(1UL, new[] { 1, 2, 3, 4 });
+        pool.BindPrefixBlock(prefixHash, b0);
+
+        float[] kv = [1f, 2f, 3f, 4f];
+        float[] outBuf = new float[4];
+
+        pool.Dispose();
+        pool.Dispose(); // Idempotent double-dispose must not throw
+
+        Assert.Throws<ObjectDisposedException>(() => _ = pool.GetKeySlotPtr(b0, 0, 0, 0));
+        Assert.Throws<ObjectDisposedException>(() => _ = pool.GetValueSlotPtr(b0, 0, 0, 0));
+        Assert.Throws<ObjectDisposedException>(() => _ = pool.GetKeyPtr(b0, 0, 0, 0));
+        Assert.Throws<ObjectDisposedException>(() => _ = pool.GetValuePtr(b0, 0, 0, 0));
+        Assert.Throws<ObjectDisposedException>(() =>
+        {
+            fixed (float* p = kv)
+            {
+                pool.Store(b0, 0, 0, p, p);
+            }
+        });
+        Assert.Throws<ObjectDisposedException>(() =>
+        {
+            fixed (float* p = outBuf)
+            {
+                pool.ReadKey(b0, 0, 0, 0, p);
+            }
+        });
+        Assert.Throws<ObjectDisposedException>(() => pool.ReadKey(b0, 0, 0, 0, outBuf.AsSpan()));
+        Assert.Throws<ObjectDisposedException>(() =>
+        {
+            fixed (float* p = outBuf)
+            {
+                pool.ReadValue(b0, 0, 0, 0, p);
+            }
+        });
+        Assert.Throws<ObjectDisposedException>(() => pool.ReadValue(b0, 0, 0, 0, outBuf.AsSpan()));
+        Assert.Throws<ObjectDisposedException>(() => pool.TryAllocateBlock(out _));
+        Assert.Throws<ObjectDisposedException>(() => pool.TryFindPrefixBlock(prefixHash, out _));
+        Assert.Throws<ObjectDisposedException>(() => pool.BindPrefixBlock(prefixHash, b0));
+        Assert.Throws<ObjectDisposedException>(() => pool.RetainBlock(b0));
+        Assert.Throws<ObjectDisposedException>(() => pool.ReleaseBlock(b0));
+        Assert.Throws<ObjectDisposedException>(() => pool.CopyBlockData(b0, b0, 1));
+        Assert.Throws<ObjectDisposedException>(() => pool.TryForkBlock(b0, 1, out _));
+    }
 }

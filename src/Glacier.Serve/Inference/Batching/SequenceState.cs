@@ -4,6 +4,8 @@ using System.Text;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
+using Glacier.Inference.Engine;
+using Glacier.Inference.Model;
 using Glacier.Inference.Sampling;
 using Glacier.Serve.Inference.PagedAttention;
 
@@ -40,6 +42,148 @@ public sealed class SequenceState
     public int LoopRecoveryTriggers { get; set; }
     public int PeriodicLoopTriggers { get; set; }
     public int BudgetClampTriggers { get; set; }
+    public bool ForcedThinkClose { get; set; }
+
+    public string? LoraAdapterName { get; init; }
+    public LoraAdapterWeights? LoraAdapter { get; init; }
+    public ulong LoraAdapterInstanceId { get; init; }
+
+    internal string? RawUserQueryForSleep { get; init; }
+    internal float[]? HiddenStateHistory { get; set; }
+    internal MtpDraftProvider? MtpDrafter { get; set; }
+
+    private ReasoningBudgetTracker _thinkTracker;
+    private int _unbudgetedScannedTextLen;
+    private int _unbudgetedMinTagSearchPos;
+    private int[]? _pendingForcedTokens;
+    private int _pendingForcedTokenIndex;
+
+    public bool HasPendingForcedTokens => _pendingForcedTokens != null && _pendingForcedTokenIndex < _pendingForcedTokens.Length;
+
+    internal void InitializeReasoningTracker(
+        int thinkId,
+        int endThinkId,
+        int maxReasoningTokens,
+        ReadOnlySpan<int> promptTokens,
+        string? promptText)
+    {
+        _thinkTracker = new ReasoningBudgetTracker(thinkId, endThinkId, maxReasoningTokens, promptTokens, promptText);
+        IsInReasoningBlock = _thinkTracker.InThink;
+        CurrentReasoningTokens = _thinkTracker.ReasoningTokens;
+        ForcedThinkClose = _thinkTracker.ForcedThinkClose;
+        _unbudgetedScannedTextLen = 0;
+        _unbudgetedMinTagSearchPos = 0;
+    }
+
+    internal bool ObserveReasoningTokenAndShouldForceClose(int tokenId, bool useSingleTokenDelimiters)
+    {
+        bool shouldForceClose = useSingleTokenDelimiters
+            ? _thinkTracker.ObserveTokenAndShouldForceClose(tokenId)
+            : _thinkTracker.ObserveDecodedTextAndShouldForceClose(GeneratedTextBuilder);
+
+        IsInReasoningBlock = _thinkTracker.InThink;
+        CurrentReasoningTokens = _thinkTracker.ReasoningTokens;
+        ForcedThinkClose = _thinkTracker.ForcedThinkClose;
+        return shouldForceClose;
+    }
+
+    internal void ObserveUnbudgetedReasoningToken(int tokenId, int thinkId, int endThinkId, bool useSingleTokenDelimiters)
+    {
+        if (useSingleTokenDelimiters)
+        {
+            if (tokenId == thinkId)
+            {
+                IsInReasoningBlock = true;
+                CurrentReasoningTokens = 0;
+            }
+            else if (tokenId == endThinkId)
+            {
+                IsInReasoningBlock = false;
+            }
+            else if (IsInReasoningBlock)
+            {
+                CurrentReasoningTokens++;
+            }
+            return;
+        }
+
+        const string openTag = "<think>";
+        const string closeTag = "</think>";
+        int curLen = GeneratedTextBuilder.Length;
+        int scanStart = Math.Max(_unbudgetedMinTagSearchPos, _unbudgetedScannedTextLen - (closeTag.Length - 1));
+        int windowLen = curLen - scanStart;
+        bool sawTag = false;
+
+        if (windowLen >= openTag.Length)
+        {
+            Span<char> stackBuf = windowLen <= 256 ? stackalloc char[windowLen] : default;
+            char[]? rented = windowLen > 256 ? new char[windowLen] : null;
+            Span<char> window = rented is null ? stackBuf : rented.AsSpan();
+            GeneratedTextBuilder.CopyTo(scanStart, window, windowLen);
+
+            int cursor = 0;
+            while (cursor <= window.Length - openTag.Length)
+            {
+                ReadOnlySpan<char> rem = window.Slice(cursor);
+                int openRel = rem.IndexOf(openTag.AsSpan(), StringComparison.Ordinal);
+                int closeRel = rem.IndexOf(closeTag.AsSpan(), StringComparison.Ordinal);
+
+                if (openRel < 0 && closeRel < 0)
+                    break;
+
+                sawTag = true;
+                if (openRel >= 0 && (closeRel < 0 || openRel < closeRel))
+                {
+                    IsInReasoningBlock = true;
+                    CurrentReasoningTokens = 0;
+                    cursor += openRel + openTag.Length;
+                }
+                else
+                {
+                    IsInReasoningBlock = false;
+                    cursor += closeRel + closeTag.Length;
+                }
+
+                _unbudgetedMinTagSearchPos = scanStart + cursor;
+            }
+        }
+
+        _unbudgetedScannedTextLen = curLen;
+        if (!sawTag && IsInReasoningBlock)
+        {
+            CurrentReasoningTokens++;
+        }
+    }
+
+    internal void MarkForcedThinkClose()
+    {
+        _thinkTracker.MarkForcedClose();
+        IsInReasoningBlock = _thinkTracker.InThink;
+        ForcedThinkClose = _thinkTracker.ForcedThinkClose;
+    }
+
+    internal void EnqueueForcedTokens(int[] tokens)
+    {
+        _pendingForcedTokens = tokens;
+        _pendingForcedTokenIndex = 0;
+    }
+
+    internal bool TryPopForcedToken(out int tokenId)
+    {
+        if (_pendingForcedTokens != null && _pendingForcedTokenIndex < _pendingForcedTokens.Length)
+        {
+            tokenId = _pendingForcedTokens[_pendingForcedTokenIndex++];
+            if (_pendingForcedTokenIndex >= _pendingForcedTokens.Length)
+            {
+                _pendingForcedTokens = null;
+                _pendingForcedTokenIndex = 0;
+            }
+            return true;
+        }
+
+        tokenId = 0;
+        return false;
+    }
 
     public Channel<string> TokenChannel { get; } = Channel.CreateUnbounded<string>(new UnboundedChannelOptions
     {

@@ -13,6 +13,7 @@ using Glacier.Serve.Core;
 using Glacier.Serve.Diagnostics;
 using Glacier.Serve.Parsing;
 using Glacier.Serve.Routing;
+using Glacier.Serve.Serialization;
 
 public sealed class GlacierServeApp : IDisposable
 {
@@ -148,7 +149,11 @@ public sealed class GlacierServeApp : IDisposable
                 var readResult = await reader.ReadAsync(connCts.Token).ConfigureAwait(false);
                 var buffer = readResult.Buffer;
 
-                if (buffer.IsEmpty && readResult.IsCompleted) break;
+                if (buffer.IsEmpty && readResult.IsCompleted)
+                {
+                    reader.AdvanceTo(buffer.End);
+                    break;
+                }
 
                 if (!TryParseRequestAndMatchRoute(
                     buffer,
@@ -163,6 +168,7 @@ public sealed class GlacierServeApp : IDisposable
                 {
                     if (buffer.Length >= 16384)
                     {
+                        reader.AdvanceTo(buffer.End);
                         var errResp = new HttpResponse(writer) { StatusCode = 431 };
                         errResp.Headers["Connection"] = "close";
                         await errResp.WriteUtf8Async("{\"error\":\"Request Header Fields Too Large\"}", connCts.Token).ConfigureAwait(false);
@@ -188,13 +194,22 @@ public sealed class GlacierServeApp : IDisposable
                 var response = new HttpResponse(writer);
                 long maxBodyBytes = MaxRequestBodySize;
 
-                // Advance past parsed HTTP request headers before reading body
+                // Slice past parsed HTTP request headers locally without advancing PipeReader yet;
+                // PipeReader.AdvanceTo must only be called once per ReadAsync.
                 buffer = buffer.Slice(headerBytesConsumed);
-                reader.AdvanceTo(buffer.Start);
 
                 if (request.Header("Transfer-Encoding")?.Contains("chunked", StringComparison.OrdinalIgnoreCase) == true)
                 {
-                    var chunkBodyStatus = await ReadChunkedBodyAsync(reader, buffer, readResult.IsCompleted, maxBodyBytes, request, connCts.Token).ConfigureAwait(false);
+                    var (chunkBodyStatus, remainingBuffer) = await ReadChunkedBodyAsync(
+                        reader,
+                        buffer,
+                        readResult.IsCompleted,
+                        maxBodyBytes,
+                        request,
+                        connCts.Token).ConfigureAwait(false);
+
+                    reader.AdvanceTo(remainingBuffer.Start);
+
                     if (chunkBodyStatus == BodyReadStatus.PayloadTooLarge)
                     {
                         response.StatusCode = 413;
@@ -214,6 +229,7 @@ public sealed class GlacierServeApp : IDisposable
                 {
                     if (!long.TryParse(clStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out long contentLength) || contentLength < 0)
                     {
+                        reader.AdvanceTo(buffer.Start);
                         response.StatusCode = 400;
                         response.Headers["Connection"] = "close";
                         await response.WriteUtf8Async("{\"error\":\"Invalid Content-Length header\"}", connCts.Token).ConfigureAwait(false);
@@ -222,6 +238,7 @@ public sealed class GlacierServeApp : IDisposable
 
                     if (contentLength > maxBodyBytes || contentLength > int.MaxValue)
                     {
+                        reader.AdvanceTo(buffer.Start);
                         response.StatusCode = 413;
                         response.Headers["Connection"] = "close";
                         await response.WriteUtf8Async("{\"error\":\"Payload Too Large\"}", connCts.Token).ConfigureAwait(false);
@@ -231,10 +248,10 @@ public sealed class GlacierServeApp : IDisposable
                     int expectedLen = (int)contentLength;
                     while (buffer.Length < expectedLen)
                     {
+                        if (readResult.IsCompleted) break;
                         reader.AdvanceTo(buffer.Start, buffer.End);
                         readResult = await reader.ReadAsync(connCts.Token).ConfigureAwait(false);
                         buffer = readResult.Buffer;
-                        if (readResult.IsCompleted && buffer.Length < expectedLen) break;
                     }
 
                     if (expectedLen > 0)
@@ -242,6 +259,7 @@ public sealed class GlacierServeApp : IDisposable
                         if (buffer.Length < expectedLen)
                         {
                             // Truncated socket stream
+                            reader.AdvanceTo(buffer.End);
                             break;
                         }
 
@@ -251,6 +269,14 @@ public sealed class GlacierServeApp : IDisposable
                         request.Body = bodyBytes;
                         reader.AdvanceTo(buffer.GetPosition(expectedLen));
                     }
+                    else
+                    {
+                        reader.AdvanceTo(buffer.Start);
+                    }
+                }
+                else
+                {
+                    reader.AdvanceTo(buffer.Start);
                 }
 
                 var context = new HttpContext(request, response, connCts.Token)
@@ -279,7 +305,33 @@ public sealed class GlacierServeApp : IDisposable
                         }
                     }
 
-                    await routeMatch.Handler(context).ConfigureAwait(false);
+                    try
+                    {
+                        await routeMatch.Handler(context).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (connCts.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        GlacierDiagnostics.LogError($"[Glacier.Serve] Route handler error on {request.Method} {request.Path}: {ex.Message}", ex);
+                        if (!response.HeadersSent)
+                        {
+                            response.StatusCode = 500;
+                            response.Headers["Connection"] = "close";
+                            var err = new ApiErrorResponse
+                            {
+                                Error = new ApiErrorDetail
+                                {
+                                    Message = ex.Message,
+                                    Type = "internal_server_error"
+                                }
+                            };
+                            await response.WriteJsonAsync(err, ServeJsonContext.Default.ApiErrorResponse, connCts.Token).ConfigureAwait(false);
+                        }
+                        break;
+                    }
                 }
                 else
                 {
@@ -319,7 +371,7 @@ public sealed class GlacierServeApp : IDisposable
         BadRequest
     }
 
-    private static async ValueTask<BodyReadStatus> ReadChunkedBodyAsync(
+    private static async ValueTask<(BodyReadStatus Status, ReadOnlySequence<byte> RemainingBuffer)> ReadChunkedBodyAsync(
         PipeReader reader,
         ReadOnlySequence<byte> buffer,
         bool isCompleted,
@@ -339,10 +391,10 @@ public sealed class GlacierServeApp : IDisposable
             while (!TryParseChunkSizeLine(buffer, out chunkSize, out headerLineEnd, out headerConsumed))
             {
                 if (headerLineEnd == -2)
-                    return BodyReadStatus.BadRequest;
+                    return (BodyReadStatus.BadRequest, buffer);
 
                 if (isCompleted)
-                    return BodyReadStatus.BadRequest;
+                    return (BodyReadStatus.BadRequest, buffer);
 
                 reader.AdvanceTo(buffer.Start, buffer.End);
                 var rr = await reader.ReadAsync(ct).ConfigureAwait(false);
@@ -351,13 +403,12 @@ public sealed class GlacierServeApp : IDisposable
             }
 
             if (chunkSize < 0)
-                return BodyReadStatus.BadRequest;
+                return (BodyReadStatus.BadRequest, buffer);
 
-            if (totalBytes + chunkSize > maxBodyBytes || totalBytes + chunkSize > int.MaxValue)
-                return BodyReadStatus.PayloadTooLarge;
+            if (chunkSize > maxBodyBytes - totalBytes || chunkSize > int.MaxValue - totalBytes)
+                return (BodyReadStatus.PayloadTooLarge, buffer);
 
             buffer = buffer.Slice(headerConsumed);
-            reader.AdvanceTo(buffer.Start);
 
             if (chunkSize == 0)
             {
@@ -367,7 +418,7 @@ public sealed class GlacierServeApp : IDisposable
                     int trailerCrlf = ConsumeLeadingCrlf(buffer);
                     if (trailerCrlf > 0)
                     {
-                        reader.AdvanceTo(buffer.GetPosition(trailerCrlf));
+                        buffer = buffer.Slice(trailerCrlf);
                         break;
                     }
 
@@ -375,7 +426,6 @@ public sealed class GlacierServeApp : IDisposable
                     if (lfPos.HasValue)
                     {
                         buffer = buffer.Slice(lfPos.Value + 1);
-                        reader.AdvanceTo(buffer.Start);
                         continue;
                     }
 
@@ -389,16 +439,19 @@ public sealed class GlacierServeApp : IDisposable
                 }
 
                 request.Body = bodyWriter.WrittenMemory;
-                return BodyReadStatus.Ok;
+                return (BodyReadStatus.Ok, buffer);
             }
 
             int chunkInt = (int)chunkSize;
             while (buffer.Length < chunkInt + 2)
             {
+                if (buffer.Length >= chunkInt + 1 && ReadByteAt(buffer, chunkInt) == (byte)'\n')
+                    break;
+
                 if (isCompleted)
                 {
                     if (buffer.Length < chunkInt + 1)
-                        return BodyReadStatus.BadRequest;
+                        return (BodyReadStatus.BadRequest, buffer);
                     break;
                 }
 
@@ -416,10 +469,16 @@ public sealed class GlacierServeApp : IDisposable
             buffer = buffer.Slice(chunkInt);
             int crlfConsume = ConsumeLeadingCrlf(buffer);
             if (crlfConsume == 0)
-                return BodyReadStatus.BadRequest;
+                return (BodyReadStatus.BadRequest, buffer);
             buffer = buffer.Slice(crlfConsume);
-            reader.AdvanceTo(buffer.Start);
         }
+    }
+
+    private static byte ReadByteAt(in ReadOnlySequence<byte> buffer, long offset)
+    {
+        Span<byte> single = stackalloc byte[1];
+        buffer.Slice(offset, 1).CopyTo(single);
+        return single[0];
     }
 
     private static long? FindByteOffset(in ReadOnlySequence<byte> buffer, byte target)

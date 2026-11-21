@@ -103,6 +103,28 @@ public sealed class BlockTable
     public ReadOnlySpan<int> AsSpan() => CollectionsMarshal.AsSpan(_physicalBlockIds);
 
     /// <summary>
+    /// Rolls back the virtual page table to <paramref name="newTokenCount"/> tokens,
+    /// releasing any trailing physical blocks back to the pool.
+    /// </summary>
+    public void TruncateTo(int newTokenCount)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(newTokenCount);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(newTokenCount, TokenCount);
+
+        if (newTokenCount == TokenCount)
+            return;
+
+        int neededBlocks = newTokenCount == 0 ? 0 : (newTokenCount + BlockSize - 1) / BlockSize;
+        for (int i = _physicalBlockIds.Count - 1; i >= neededBlocks; i--)
+        {
+            _pool.ReleaseBlock(_physicalBlockIds[i]);
+            _physicalBlockIds.RemoveAt(i);
+        }
+
+        TokenCount = newTokenCount;
+    }
+
+    /// <summary>
     /// Recycles all physical blocks back to the pool and resets sequence state.
     /// </summary>
     public void ReleaseAll()

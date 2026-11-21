@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Glacier.Inference.Engine;
 
 namespace Glacier.Serve.Inference.Batching;
 
@@ -12,6 +13,18 @@ public sealed class ChatMessage
 
     [JsonPropertyName("content")]
     public string Content { get; set; } = string.Empty;
+}
+
+public sealed class ChatTemplateKwargs
+{
+    [JsonPropertyName("enable_thinking")]
+    public bool? EnableThinking { get; set; }
+}
+
+public sealed class StreamOptions
+{
+    [JsonPropertyName("include_usage")]
+    public bool IncludeUsage { get; set; }
 }
 
 /// <summary>
@@ -40,6 +53,95 @@ public sealed class OllamaOptions
     [JsonPropertyName("stop")]
     [JsonConverter(typeof(PolymorphicStopSequencesConverter))]
     public string[]? Stop { get; set; }
+
+    [JsonPropertyName("max_think_tokens")]
+    [JsonConverter(typeof(PolymorphicReasoningBudgetConverter))]
+    public int? MaxThinkTokens { get; set; }
+
+    [JsonPropertyName("max_thinking_tokens")]
+    [JsonConverter(typeof(PolymorphicReasoningBudgetConverter))]
+    public int? MaxThinkingTokens { get; set; }
+
+    [JsonPropertyName("reasoning_budget")]
+    [JsonConverter(typeof(PolymorphicReasoningBudgetConverter))]
+    public int? ReasoningBudget { get; set; }
+}
+
+/// <summary>
+/// AOT-safe JSON converter accepting integer, boolean (<c>false</c> -> 0, <c>true</c> -> auto),
+/// or string reasoning budget settings (<c>"auto"</c>, <c>"off"</c>, <c>"none"</c>, <c>"unlimited"</c>, numeric).
+/// </summary>
+public sealed class PolymorphicReasoningBudgetConverter : JsonConverter<int?>
+{
+    public override int? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        switch (reader.TokenType)
+        {
+            case JsonTokenType.Null:
+                return null;
+            case JsonTokenType.False:
+                return 0;
+            case JsonTokenType.True:
+                return ReasoningBudgetPolicy.AutoBudgetSentinel;
+            case JsonTokenType.Number:
+                if (!reader.TryGetInt32(out int intValue))
+                    throw new JsonException("Reasoning budget number must be a valid 32-bit integer.");
+                if (intValue < ReasoningBudgetPolicy.AutoBudgetSentinel)
+                    throw new JsonException($"Reasoning budget integer '{intValue}' must be >= {ReasoningBudgetPolicy.AutoBudgetSentinel}.");
+                return intValue;
+            case JsonTokenType.String:
+                string? raw = reader.GetString();
+                if (!ReasoningBudgetPolicy.TryParseSetting(raw, out int parsed))
+                    throw new JsonException($"Invalid reasoning budget value '{raw}'.");
+                return parsed;
+            default:
+                throw new JsonException($"Unsupported JSON token '{reader.TokenType}' for reasoning budget parameter.");
+        }
+    }
+
+    public override void Write(Utf8JsonWriter writer, int? value, JsonSerializerOptions options)
+    {
+        if (value.HasValue)
+            writer.WriteNumberValue(value.Value);
+        else
+            writer.WriteNullValue();
+    }
+}
+
+/// <summary>
+/// AOT-safe JSON converter for non-nullable <c>int</c> reasoning budget properties.
+/// </summary>
+public sealed class PolymorphicIntReasoningBudgetConverter : JsonConverter<int>
+{
+    public override int Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        switch (reader.TokenType)
+        {
+            case JsonTokenType.Null:
+            case JsonTokenType.False:
+                return 0;
+            case JsonTokenType.True:
+                return ReasoningBudgetPolicy.AutoBudgetSentinel;
+            case JsonTokenType.Number:
+                if (!reader.TryGetInt32(out int intValue))
+                    throw new JsonException("Reasoning budget number must be a valid 32-bit integer.");
+                if (intValue < ReasoningBudgetPolicy.AutoBudgetSentinel)
+                    throw new JsonException($"Reasoning budget integer '{intValue}' must be >= {ReasoningBudgetPolicy.AutoBudgetSentinel}.");
+                return intValue;
+            case JsonTokenType.String:
+                string? raw = reader.GetString();
+                if (!ReasoningBudgetPolicy.TryParseSetting(raw, out int parsed))
+                    throw new JsonException($"Invalid reasoning budget value '{raw}'.");
+                return parsed;
+            default:
+                throw new JsonException($"Unsupported JSON token '{reader.TokenType}' for reasoning budget parameter.");
+        }
+    }
+
+    public override void Write(Utf8JsonWriter writer, int value, JsonSerializerOptions options)
+    {
+        writer.WriteNumberValue(value);
+    }
 }
 
 /// <summary>
@@ -108,6 +210,8 @@ public sealed class PolymorphicStopSequencesConverter : JsonConverter<string[]?>
 public sealed class InferenceRequest
 {
     private bool _stream;
+    private int _maxReasoningTokens;
+    private bool _hasMaxReasoningTokens;
 
     [JsonPropertyName("prompt")]
     public string? Prompt { get; set; }
@@ -161,7 +265,28 @@ public sealed class InferenceRequest
     public string[]? Stop { get; set; }
 
     [JsonPropertyName("max_reasoning_tokens")]
-    public int MaxReasoningTokens { get; set; } = 0;
+    [JsonConverter(typeof(PolymorphicIntReasoningBudgetConverter))]
+    public int MaxReasoningTokens
+    {
+        get => _maxReasoningTokens;
+        set
+        {
+            _maxReasoningTokens = value;
+            _hasMaxReasoningTokens = true;
+        }
+    }
+
+    [JsonPropertyName("max_think_tokens")]
+    [JsonConverter(typeof(PolymorphicReasoningBudgetConverter))]
+    public int? MaxThinkTokens { get; set; }
+
+    [JsonPropertyName("max_thinking_tokens")]
+    [JsonConverter(typeof(PolymorphicReasoningBudgetConverter))]
+    public int? MaxThinkingTokens { get; set; }
+
+    [JsonPropertyName("reasoning_budget")]
+    [JsonConverter(typeof(PolymorphicReasoningBudgetConverter))]
+    public int? ReasoningBudget { get; set; }
 
     [JsonPropertyName("enable_reasoning_loop_guard")]
     public bool? EnableReasoningLoopGuard { get; set; }
@@ -171,6 +296,15 @@ public sealed class InferenceRequest
 
     [JsonPropertyName("enable_thinking")]
     public bool? EnableThinking { get; set; }
+
+    [JsonPropertyName("chat_template_kwargs")]
+    public ChatTemplateKwargs? ChatTemplateKwargs { get; set; }
+
+    [JsonPropertyName("stream_options")]
+    public StreamOptions? StreamOptions { get; set; }
+
+    [JsonPropertyName("lora")]
+    public string? Lora { get; set; }
 
     [JsonPropertyName("options")]
     public OllamaOptions? Options { get; set; }
@@ -199,4 +333,27 @@ public sealed class InferenceRequest
 
     [JsonIgnore]
     public string[]? EffectiveStop => Options?.Stop ?? Stop;
+
+    [JsonIgnore]
+    public bool? EffectiveEnableThinking => ChatTemplateKwargs?.EnableThinking ?? EnableThinking;
+
+    [JsonIgnore]
+    public bool HasExplicitReasoningBudget =>
+        MaxThinkTokens.HasValue ||
+        MaxThinkingTokens.HasValue ||
+        ReasoningBudget.HasValue ||
+        _hasMaxReasoningTokens ||
+        Options?.MaxThinkTokens.HasValue == true ||
+        Options?.MaxThinkingTokens.HasValue == true ||
+        Options?.ReasoningBudget.HasValue == true;
+
+    public int GetEffectiveReasoningBudget(int defaultBudget = 0) =>
+        MaxThinkTokens ??
+        MaxThinkingTokens ??
+        ReasoningBudget ??
+        (_hasMaxReasoningTokens ? (int?)_maxReasoningTokens : null) ??
+        Options?.MaxThinkTokens ??
+        Options?.MaxThinkingTokens ??
+        Options?.ReasoningBudget ??
+        defaultBudget;
 }

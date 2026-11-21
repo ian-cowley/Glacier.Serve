@@ -133,15 +133,16 @@ public sealed class AutonomousSleepDaemon : IDisposable, IAsyncDisposable
 
         lock (_stateLock)
         {
-            if (_state == SleepLifecycleState.Sleeping || _state == SleepLifecycleState.EnteringSleep)
+            if (_state != SleepLifecycleState.Awake)
             {
                 return null;
             }
-            SetState(SleepLifecycleState.EnteringSleep);
+            _state = SleepLifecycleState.EnteringSleep;
         }
 
         try
         {
+            StateChanged?.Invoke(SleepLifecycleState.EnteringSleep);
             SetState(SleepLifecycleState.Sleeping);
 
             // Dequeue accumulated dream candidates
