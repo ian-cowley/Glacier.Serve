@@ -119,6 +119,34 @@ public sealed class HealthCheckResponse
     [JsonPropertyName("throughput_tok_s")] public double ThroughputTokS { get; set; }
     [JsonPropertyName("sleep_state")] public string? SleepState { get; set; }
     [JsonPropertyName("pending_dreams")] public int? PendingDreams { get; set; }
+    [JsonPropertyName("devices")] public List<AcceleratorDeviceStatus>? Devices { get; set; }
+    [JsonPropertyName("npu_devices")] public List<AcceleratorDeviceStatus>? NpuDevices { get; set; }
+    [JsonPropertyName("npu_sidecar")] public NpuSidecarStatus? NpuSidecar { get; set; }
+}
+
+public sealed class AcceleratorDeviceStatus
+{
+    [JsonPropertyName("id")] public string Id { get; set; } = string.Empty;
+    [JsonPropertyName("index")] public int Index { get; set; }
+    [JsonPropertyName("name")] public string Name { get; set; } = string.Empty;
+    [JsonPropertyName("vendor")] public string Vendor { get; set; } = string.Empty;
+    [JsonPropertyName("type")] public string Type { get; set; } = string.Empty;
+    [JsonPropertyName("is_npu")] public bool IsNpu { get; set; }
+    [JsonPropertyName("dedicated_vram_bytes")] public ulong DedicatedVramBytes { get; set; }
+    [JsonPropertyName("shared_vram_bytes")] public ulong SharedVramBytes { get; set; }
+    [JsonPropertyName("dedicated_vram_gb")] public double DedicatedVramGb { get; set; }
+    [JsonPropertyName("shared_vram_gb")] public double SharedVramGb { get; set; }
+    [JsonPropertyName("recommended_engine")] public string RecommendedEngine { get; set; } = string.Empty;
+    [JsonPropertyName("supported_engines")] public List<string> SupportedEngines { get; set; } = [];
+}
+
+public sealed class NpuSidecarStatus
+{
+    [JsonPropertyName("available")] public bool Available { get; set; }
+    [JsonPropertyName("base_url")] public string? BaseUrl { get; set; }
+    [JsonPropertyName("runtime")] public string? Runtime { get; set; }
+    [JsonPropertyName("models")] public List<string> Models { get; set; } = [];
+    [JsonPropertyName("latency_ms")] public double? LatencyMs { get; set; }
 }
 
 public sealed class SleepStatusResponse
@@ -160,6 +188,22 @@ public sealed class SleepMemoryStatusResponse
     [JsonPropertyName("last_selected_traces")] public int LastSelectedTraces { get; init; }
     [JsonPropertyName("last_packed_tokens")] public int LastPackedTokens { get; init; }
     [JsonPropertyName("last_elapsed_ms")] public double LastElapsedMs { get; init; }
+
+    [JsonPropertyName("npu_embeddings_active")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? NpuEmbeddingsActive { get; init; }
+
+    [JsonPropertyName("embedding_dimensions")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? EmbeddingDimensions { get; init; }
+
+    [JsonPropertyName("embedding_endpoint")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? EmbeddingEndpoint { get; init; }
+
+    [JsonPropertyName("embedding_model")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? EmbeddingModel { get; init; }
 }
 
 /// <summary>
@@ -270,6 +314,10 @@ public sealed class TensorDto
 [JsonSerializable(typeof(OllamaModelItem))]
 [JsonSerializable(typeof(TensorDto))]
 [JsonSerializable(typeof(HealthCheckResponse))]
+[JsonSerializable(typeof(AcceleratorDeviceStatus))]
+[JsonSerializable(typeof(List<AcceleratorDeviceStatus>))]
+[JsonSerializable(typeof(NpuSidecarStatus))]
+[JsonSerializable(typeof(List<string>))]
 [JsonSerializable(typeof(SleepStatusResponse))]
 [JsonSerializable(typeof(SleepTriggerResponse))]
 [JsonSerializable(typeof(SleepMemoryStatusResponse))]

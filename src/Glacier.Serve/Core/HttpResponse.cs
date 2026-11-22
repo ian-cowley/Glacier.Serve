@@ -103,7 +103,7 @@ public sealed class HttpResponse
 
         ReadOnlySpan<byte> httpPrefix = "HTTP/1.1 "u8;
         ReadOnlySpan<byte> ctPrefix = "\r\nContent-Type: "u8;
-        ReadOnlySpan<byte> serverHeader = "\r\nServer: Glacier.Serve/1.2.0 (.NET 10)\r\n"u8;
+        ReadOnlySpan<byte> serverHeader = "\r\nServer: Glacier.Serve/1.8.0 (.NET 10)\r\n"u8;
         ReadOnlySpan<byte> clPrefix = "Content-Length: "u8;
         ReadOnlySpan<byte> crlf = "\r\n"u8;
         ReadOnlySpan<byte> colonSpace = ": "u8;

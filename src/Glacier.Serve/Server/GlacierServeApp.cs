@@ -27,7 +27,7 @@ public sealed class GlacierServeApp : IDisposable
     private CancellationTokenSource? _cts;
     private Task? _listenTask;
 
-    public int Port => _port;
+    public int Port => (_listener?.LocalEndpoint as IPEndPoint)?.Port ?? _port;
     public bool IsRunning => _listener != null;
 
     public long MaxRequestBodySize
