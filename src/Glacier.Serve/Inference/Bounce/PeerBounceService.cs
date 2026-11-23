@@ -321,6 +321,17 @@ public sealed partial class SandboxedProcessBounceVerifier : IBounceVerifier
         {
             await File.WriteAllTextAsync(tmpJs, sb.ToString(), Encoding.UTF8, ct).ConfigureAwait(false);
             var res = await RunSandboxedAsync(_nodeExe, ["--check", tmpJs], tempDir, _scriptTimeout, ct).ConfigureAwait(false);
+            if (!OperatingSystem.IsWindows()
+                && _enableNamespaceIsolation
+                && !res.TimedOut
+                && res.ExitCode != 0
+                && res.StandardError.Contains("Native stack trace", StringComparison.OrdinalIgnoreCase))
+            {
+                // Node.js 22/24 on some Linux kernels/CI containers aborts in node::Start under CLONE_NEWPID
+                // when /proc is not remounted. Retry --check (parse-only, no execution) inside the same
+                // OsProcessSandbox with namespace isolation disabled (retaining NO_NEW_PRIVS, rlimits, and timeout).
+                res = await RunSandboxedAsync(_nodeExe, ["--check", tmpJs], tempDir, _scriptTimeout, ct, enableNamespaceIsolationOverride: false).ConfigureAwait(false);
+            }
             if (res.TimedOut)
             {
                 return new BounceVerificationResult(false, $"Node --check timed out after {_scriptTimeout.TotalMilliseconds:F0} ms.");
@@ -455,7 +466,8 @@ public sealed partial class SandboxedProcessBounceVerifier : IBounceVerifier
         IReadOnlyList<string> args,
         string workingDirectory,
         TimeSpan timeout,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool? enableNamespaceIsolationOverride = null)
     {
         var options = new SandboxOptions
         {
@@ -466,7 +478,7 @@ public sealed partial class SandboxedProcessBounceVerifier : IBounceVerifier
             MemoryLimitBytes = _memoryLimitBytes,
             AllowNetwork = _allowNetwork,
             MaxProcesses = _maxProcesses,
-            EnableNamespaceIsolation = _enableNamespaceIsolation
+            EnableNamespaceIsolation = enableNamespaceIsolationOverride ?? _enableNamespaceIsolation
         };
 
         var result = await _sandbox.ExecuteAsync(options, ct).ConfigureAwait(false);
