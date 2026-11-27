@@ -1,7 +1,9 @@
 namespace Glacier.Serve.Server;
 
 using System;
+using System.Collections.Generic;
 using System.Net;
+using System.Security.Cryptography.X509Certificates;
 using Glacier.Serve.Routing;
 
 public sealed class GlacierServeBuilder
@@ -10,6 +12,11 @@ public sealed class GlacierServeBuilder
     private IPAddress _address = IPAddress.Loopback;
     private long _maxRequestBodySize = GlacierServeApp.DefaultMaxRequestBodySize;
     private readonly RadixTreeRouter _router = new();
+    private X509Certificate2? _tlsCertificate;
+    private string? _bearerToken;
+    private readonly HashSet<string> _authExemptPaths = new(StringComparer.Ordinal);
+    private int _maxConcurrentConnections;
+    private TimeSpan? _headerTimeout;
 
     public GlacierServeBuilder UsePort(int port)
     {
@@ -29,6 +36,45 @@ public sealed class GlacierServeBuilder
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(maxBytes, 0);
         _maxRequestBodySize = maxBytes;
+        return this;
+    }
+
+    public GlacierServeBuilder UseTls(X509Certificate2 certificate)
+    {
+        ArgumentNullException.ThrowIfNull(certificate);
+        if (!certificate.HasPrivateKey)
+            throw new ArgumentException("TLS server certificate must include a private key.", nameof(certificate));
+        _tlsCertificate = certificate;
+        return this;
+    }
+
+    public GlacierServeBuilder UseBearerAuth(string bearerToken, params string[] exemptPaths)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(bearerToken);
+        _bearerToken = bearerToken;
+        _authExemptPaths.Clear();
+        if (exemptPaths != null)
+        {
+            foreach (string p in exemptPaths)
+            {
+                if (!string.IsNullOrEmpty(p))
+                    _authExemptPaths.Add(p);
+            }
+        }
+        return this;
+    }
+
+    public GlacierServeBuilder WithMaxConcurrentConnections(int maxConnections)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(maxConnections, 0);
+        _maxConcurrentConnections = maxConnections;
+        return this;
+    }
+
+    public GlacierServeBuilder WithHeaderTimeout(TimeSpan timeout)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(timeout, TimeSpan.Zero);
+        _headerTimeout = timeout;
         return this;
     }
 
@@ -58,6 +104,15 @@ public sealed class GlacierServeBuilder
 
     public GlacierServeApp Build()
     {
-        return new GlacierServeApp(_address, _port, _router, _maxRequestBodySize);
+        return new GlacierServeApp(
+            _address,
+            _port,
+            _router,
+            _maxRequestBodySize,
+            _tlsCertificate,
+            _bearerToken,
+            _authExemptPaths,
+            _maxConcurrentConnections,
+            _headerTimeout);
     }
 }

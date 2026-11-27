@@ -119,7 +119,19 @@ curl http://127.0.0.1:5055/api/generate   -H "Content-Type: application/json"   
 ## 📦 NuGet Installation
 
 ```bash
-dotnet add package Glacier.Serve --version 1.2.0
+dotnet add package Glacier.Serve --version 1.9.0
+```
+
+---
+
+## 🆕 What's New in v1.9.0
+
+- **Production Security & Transport Hardening (`GlacierServeBuilder` / `GlacierServeApp`)**:
+  - `.UseTls(X509Certificate2)`: Server-side `SslStream` TLS 1.2/1.3 termination with private-key validation.
+  - `.UseBearerAuth(token, exemptPaths...)`: Constant-time `CryptographicOperations.FixedTimeEquals` Bearer auth (`401 Unauthorized`) with exempt route support (e.g. `/health`).
+  - `.WithMaxConcurrentConnections(max)`: Admission control returning `503 Service Unavailable` with clean socket drain under overload.
+  - `.WithHeaderTimeout(timeout)`: Slowloris header timeout closing stalled clients with `408 Request Timeout`.
+- **HTTP/1.1 Chunked SSE Streaming (`HttpResponse`)** — Added `WriteChunkAsync`, `CompleteChunkedAsync`, and `WriteSseEventAsync` with `FlushResult.IsCompleted`/`IsCanceled` checks and `Glacier.Serve/1.9.0` server banner.
 ```
 
 ---

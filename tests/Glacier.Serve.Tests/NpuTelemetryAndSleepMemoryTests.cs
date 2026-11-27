@@ -120,7 +120,7 @@ public sealed class NpuTelemetryAndSleepMemoryTests
             Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
             Assert.True(resp.Headers.TryGetValues("Server", out var serverValues));
-            Assert.Contains("Glacier.Serve/1.8.0 (.NET 10)", string.Join(" ", serverValues));
+            Assert.Contains("Glacier.Serve/1.9.0 (.NET 10)", string.Join(" ", serverValues));
 
             string json = await resp.Content.ReadAsStringAsync();
             var health = JsonSerializer.Deserialize(json, ServeJsonContext.Default.HealthCheckResponse);

@@ -105,10 +105,10 @@ public static class HttpSimdParser
         path = remaining[..secondSpace];
         var version = remaining[(secondSpace + 1)..];
 
-        if (version.Length < 8 || !version.StartsWith("HTTP/"u8)) return false;
+        if (version.Length != 8 || (!version.SequenceEqual("HTTP/1.1"u8) && !version.SequenceEqual("HTTP/1.0"u8))) return false;
+        if (buffer[eol] != (byte)'\r' || buffer.Length <= eol + 1 || buffer[eol + 1] != (byte)'\n') return false;
 
-        int lineEndLength = (buffer[eol] == (byte)'\r' && buffer.Length > eol + 1 && buffer[eol + 1] == (byte)'\n') ? 2 : 1;
-        bytesConsumed = eol + lineEndLength;
+        bytesConsumed = eol + 2;
         return true;
     }
 
@@ -125,12 +125,18 @@ public static class HttpSimdParser
 
         int eol = IndexOfCrlfVector256(buffer);
         if (eol < 0) return false;
+        if (buffer[eol] != (byte)'\r' || buffer.Length <= eol + 1 || buffer[eol + 1] != (byte)'\n') return false;
 
         var line = buffer[..eol];
         int colonIdx = IndexOfByteVector256(line, (byte)':');
         if (colonIdx <= 0) return false;
 
         headerName = line[..colonIdx];
+        for (int i = 0; i < headerName.Length; i++)
+        {
+            byte b = headerName[i];
+            if (b <= 0x20 || b == 0x7F) return false;
+        }
         var valSpan = line[(colonIdx + 1)..];
 
         // RFC 7230 §3.2.4: Trim leading OWS
@@ -142,8 +148,7 @@ public static class HttpSimdParser
             valSpan = valSpan[..^1];
 
         headerValue = valSpan;
-        int lineEndLength = (buffer[eol] == (byte)'\r' && buffer.Length > eol + 1 && buffer[eol + 1] == (byte)'\n') ? 2 : 1;
-        bytesConsumed = eol + lineEndLength;
+        bytesConsumed = eol + 2;
         return true;
     }
 

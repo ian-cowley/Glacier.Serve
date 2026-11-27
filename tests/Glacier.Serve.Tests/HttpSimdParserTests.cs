@@ -67,4 +67,18 @@ public class HttpSimdParserTests
         int idx = HttpSimdParser.IndexOfByteVector256(buffer, (byte)' ');
         Assert.Equal(75, idx);
     }
+
+    [Fact]
+    public void TryParseRequestLine_RejectsTrailingGarbageAndBareLf()
+    {
+        Assert.False(HttpSimdParser.TryParseRequestLine("GET / HTTP/1.1GARBAGE\r\n"u8, out _, out _, out _));
+        Assert.False(HttpSimdParser.TryParseRequestLine("GET / HTTP/1.1\nHost: localhost\r\n"u8, out _, out _, out _));
+    }
+
+    [Fact]
+    public void TryParseHeader_RejectsPreColonWhitespaceAndBareLf()
+    {
+        Assert.False(HttpSimdParser.TryParseHeader("Content-Length : 5\r\n"u8, out _, out _, out _));
+        Assert.False(HttpSimdParser.TryParseHeader("Host: localhost\n"u8, out _, out _, out _));
+    }
 }

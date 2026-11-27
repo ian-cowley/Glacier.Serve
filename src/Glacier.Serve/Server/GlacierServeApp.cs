@@ -2,10 +2,16 @@ namespace Glacier.Serve.Server;
 
 using System;
 using System.Buffers;
+using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.IO.Pipelines;
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Authentication;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -22,6 +28,11 @@ public sealed class GlacierServeApp : IDisposable
     private readonly int _port;
     private readonly IPAddress _address;
     private readonly RadixTreeRouter _router;
+    private readonly X509Certificate2? _tlsCertificate;
+    private readonly byte[]? _bearerTokenBytes;
+    private readonly HashSet<string>? _authExemptPaths;
+    private readonly SemaphoreSlim? _connectionGate;
+    private readonly TimeSpan? _headerTimeout;
     private long _maxRequestBodySize;
     private TcpListener? _listener;
     private CancellationTokenSource? _cts;
@@ -40,12 +51,28 @@ public sealed class GlacierServeApp : IDisposable
         }
     }
 
-    internal GlacierServeApp(IPAddress address, int port, RadixTreeRouter router, long maxRequestBodySize = DefaultMaxRequestBodySize)
+    internal GlacierServeApp(
+        IPAddress address,
+        int port,
+        RadixTreeRouter router,
+        long maxRequestBodySize = DefaultMaxRequestBodySize,
+        X509Certificate2? tlsCertificate = null,
+        string? bearerToken = null,
+        IReadOnlyCollection<string>? authExemptPaths = null,
+        int maxConcurrentConnections = 0,
+        TimeSpan? headerTimeout = null)
     {
         _address = address;
         _port = port;
         _router = router;
         _maxRequestBodySize = maxRequestBodySize;
+        _tlsCertificate = tlsCertificate;
+        _bearerTokenBytes = !string.IsNullOrEmpty(bearerToken) ? Encoding.UTF8.GetBytes(bearerToken) : null;
+        _authExemptPaths = authExemptPaths is { Count: > 0 }
+            ? new HashSet<string>(authExemptPaths, StringComparer.Ordinal)
+            : null;
+        _connectionGate = maxConcurrentConnections > 0 ? new SemaphoreSlim(maxConcurrentConnections, maxConcurrentConnections) : null;
+        _headerTimeout = headerTimeout;
     }
 
     public static GlacierServeBuilder CreateBuilder(string[]? args = null) => new();
@@ -87,6 +114,11 @@ public sealed class GlacierServeApp : IDisposable
                 var socket = await listener.AcceptSocketAsync(ct).ConfigureAwait(false);
                 failureCount = 0;
                 socket.NoDelay = true;
+                if (_connectionGate != null && !_connectionGate.Wait(0))
+                {
+                    _ = SendServiceUnavailableAndCloseAsync(socket);
+                    continue;
+                }
                 _ = Task.Run(() => ProcessConnectionAsync(socket, ct), ct);
             }
             catch (OperationCanceledException)
@@ -137,46 +169,112 @@ public sealed class GlacierServeApp : IDisposable
 
     private async Task ProcessConnectionAsync(Socket socket, CancellationToken ct)
     {
-        using var stream = new NetworkStream(socket, ownsSocket: true);
-        var reader = PipeReader.Create(stream);
-        var writer = PipeWriter.Create(stream);
+        Stream? stream = null;
+        PipeReader? reader = null;
+        PipeWriter? writer = null;
         using var connCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
         try
         {
+            stream = new NetworkStream(socket, ownsSocket: true);
+            if (_tlsCertificate != null)
+            {
+                var sslStream = new SslStream(stream, leaveInnerStreamOpen: false);
+                stream = sslStream;
+                using var tlsCts = _headerTimeout is { } ht
+                    ? CancellationTokenSource.CreateLinkedTokenSource(connCts.Token)
+                    : null;
+                if (tlsCts != null) tlsCts.CancelAfter(_headerTimeout!.Value);
+                var tlsToken = tlsCts?.Token ?? connCts.Token;
+                await sslStream.AuthenticateAsServerAsync(
+                    new SslServerAuthenticationOptions
+                    {
+                        ServerCertificate = _tlsCertificate,
+                        EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+                        CertificateRevocationCheckMode = X509RevocationMode.NoCheck
+                    },
+                    tlsToken).ConfigureAwait(false);
+            }
+
+            reader = PipeReader.Create(stream);
+            writer = PipeWriter.Create(stream);
+
             while (!connCts.IsCancellationRequested)
             {
-                var readResult = await reader.ReadAsync(connCts.Token).ConfigureAwait(false);
-                var buffer = readResult.Buffer;
+                using var headerCts = _headerTimeout is { } headerTimeout
+                    ? CancellationTokenSource.CreateLinkedTokenSource(connCts.Token)
+                    : null;
+                if (headerCts != null) headerCts.CancelAfter(_headerTimeout!.Value);
+                CancellationToken headerToken = headerCts?.Token ?? connCts.Token;
 
-                if (buffer.IsEmpty && readResult.IsCompleted)
+                ReadResult readResult;
+                HeaderParseResult parseResult;
+                HttpMethod method;
+                string path;
+                string queryString;
+                Dictionary<string, string> headers;
+                bool routeMatched;
+                RouteMatch routeMatch;
+                int headerBytesConsumed;
+                ReadOnlySequence<byte> buffer;
+
+                while (true)
                 {
-                    reader.AdvanceTo(buffer.End);
+                    try
+                    {
+                        readResult = await reader.ReadAsync(headerToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (headerCts != null && headerCts.IsCancellationRequested && !connCts.IsCancellationRequested)
+                    {
+                        var timeoutResp = new HttpResponse(writer) { StatusCode = 408 };
+                        timeoutResp.Headers["Connection"] = "close";
+                        await timeoutResp.WriteUtf8Async("{\"error\":\"Request Timeout\"}", connCts.Token).ConfigureAwait(false);
+                        return;
+                    }
+
+                    buffer = readResult.Buffer;
+                    if (buffer.IsEmpty && readResult.IsCompleted)
+                    {
+                        reader.AdvanceTo(buffer.End);
+                        return;
+                    }
+
+                    parseResult = TryParseRequestAndMatchRoute(
+                        buffer,
+                        _router,
+                        out method,
+                        out path,
+                        out queryString,
+                        out headers,
+                        out routeMatched,
+                        out routeMatch,
+                        out headerBytesConsumed);
+
+                    if (parseResult == HeaderParseResult.Incomplete)
+                    {
+                        if (buffer.Length >= 16384)
+                        {
+                            reader.AdvanceTo(buffer.End);
+                            var errResp = new HttpResponse(writer) { StatusCode = 431 };
+                            errResp.Headers["Connection"] = "close";
+                            await errResp.WriteUtf8Async("{\"error\":\"Request Header Fields Too Large\"}", connCts.Token).ConfigureAwait(false);
+                            return;
+                        }
+                        reader.AdvanceTo(buffer.Start, buffer.End);
+                        if (readResult.IsCompleted) return;
+                        continue;
+                    }
+
                     break;
                 }
 
-                if (!TryParseRequestAndMatchRoute(
-                    buffer,
-                    _router,
-                    out var method,
-                    out var path,
-                    out var queryString,
-                    out var headers,
-                    out bool routeMatched,
-                    out var routeMatch,
-                    out int headerBytesConsumed))
+                if (parseResult == HeaderParseResult.Malformed)
                 {
-                    if (buffer.Length >= 16384)
-                    {
-                        reader.AdvanceTo(buffer.End);
-                        var errResp = new HttpResponse(writer) { StatusCode = 431 };
-                        errResp.Headers["Connection"] = "close";
-                        await errResp.WriteUtf8Async("{\"error\":\"Request Header Fields Too Large\"}", connCts.Token).ConfigureAwait(false);
-                        break;
-                    }
-                    reader.AdvanceTo(buffer.Start, buffer.End);
-                    if (readResult.IsCompleted) break;
-                    continue;
+                    reader.AdvanceTo(buffer.End);
+                    var errResp = new HttpResponse(writer) { StatusCode = 400 };
+                    errResp.Headers["Connection"] = "close";
+                    await errResp.WriteUtf8Async("{\"error\":\"Bad Request\"}", connCts.Token).ConfigureAwait(false);
+                    break;
                 }
 
                 var request = new HttpRequest
@@ -294,6 +392,16 @@ public sealed class GlacierServeApp : IDisposable
                     }
                 };
 
+                if (!IsBearerAuthorized(request))
+                {
+                    response.StatusCode = 401;
+                    response.ContentType = "application/json; charset=utf-8";
+                    response.Headers["WWW-Authenticate"] = "Bearer";
+                    response.Headers["Connection"] = "close";
+                    await response.WriteUtf8Async("{\"error\":\"Unauthorized\"}", connCts.Token).ConfigureAwait(false);
+                    break;
+                }
+
                 if (routeMatched)
                 {
                     if (routeMatch.Parameters != null)
@@ -359,9 +467,63 @@ public sealed class GlacierServeApp : IDisposable
         finally
         {
             connCts.Cancel();
-            try { await reader.CompleteAsync().ConfigureAwait(false); } catch { }
-            try { await writer.CompleteAsync().ConfigureAwait(false); } catch { }
+            if (reader != null) try { await reader.CompleteAsync().ConfigureAwait(false); } catch { }
+            if (writer != null) try { await writer.CompleteAsync().ConfigureAwait(false); } catch { }
+            if (stream != null) try { await stream.DisposeAsync().ConfigureAwait(false); } catch { }
+            else socket.Dispose();
+            _connectionGate?.Release();
         }
+    }
+
+    private static async Task SendServiceUnavailableAndCloseAsync(Socket socket)
+    {
+        try
+        {
+            byte[] drain = ArrayPool<byte>.Shared.Rent(1024);
+            try
+            {
+                // Drain incoming request headers briefly so Winsock does not emit RST before the client reads 503.
+                if (socket.Poll(10_000, SelectMode.SelectRead))
+                {
+                    await socket.ReceiveAsync(drain, SocketFlags.None).ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(drain);
+            }
+
+            await socket.SendAsync(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"u8.ToArray(),
+                SocketFlags.None).ConfigureAwait(false);
+            socket.Shutdown(SocketShutdown.Both);
+        }
+        catch
+        {
+        }
+        finally
+        {
+            socket.Dispose();
+        }
+    }
+
+    private bool IsBearerAuthorized(HttpRequest request)
+    {
+        if (_bearerTokenBytes == null)
+            return true;
+
+        if (_authExemptPaths != null && _authExemptPaths.Contains(request.Path))
+            return true;
+
+        string? authHeader = request.Header("Authorization");
+        if (string.IsNullOrEmpty(authHeader) || !authHeader.StartsWith("Bearer ", StringComparison.Ordinal))
+            return false;
+
+        byte[] supplied = Encoding.UTF8.GetBytes(authHeader.AsSpan(7).ToString());
+        if (supplied.Length != _bearerTokenBytes.Length)
+            return false;
+
+        return CryptographicOperations.FixedTimeEquals(supplied, _bearerTokenBytes);
     }
 
     private enum BodyReadStatus
@@ -615,7 +777,23 @@ public sealed class GlacierServeApp : IDisposable
         }
     }
 
-    private static bool TryParseRequestAndMatchRoute(
+    private enum HeaderParseResult
+    {
+        Incomplete = 0,
+        Valid = 1,
+        Malformed = 2
+    }
+
+    private static bool HasCompleteOrInvalidLineEnding(ReadOnlySpan<byte> span)
+    {
+        int eol = HttpSimdParser.IndexOfCrlfVector256(span);
+        if (eol < 0) return false;
+        if (span[eol] == (byte)'\n') return true;
+        // Found '\r': only complete/invalid if another byte follows it
+        return span.Length > eol + 1;
+    }
+
+    private static HeaderParseResult TryParseRequestAndMatchRoute(
         in ReadOnlySequence<byte> buffer,
         IRouter router,
         out HttpMethod method,
@@ -678,7 +856,7 @@ public sealed class GlacierServeApp : IDisposable
         }
     }
 
-    private static bool TryParseSpanHeadersAndMatch(
+    private static HeaderParseResult TryParseSpanHeadersAndMatch(
         ReadOnlySpan<byte> span,
         IRouter router,
         out HttpMethod method,
@@ -699,7 +877,7 @@ public sealed class GlacierServeApp : IDisposable
 
         if (!HttpSimdParser.TryParseRequestLine(span, out var methodSpan, out var targetSpan, out int reqLineConsumed))
         {
-            return false;
+            return HasCompleteOrInvalidLineEnding(span) ? HeaderParseResult.Malformed : HeaderParseResult.Incomplete;
         }
 
         method = HttpSimdParser.ParseMethod(methodSpan);
@@ -727,33 +905,65 @@ public sealed class GlacierServeApp : IDisposable
 
         var headerSpan = span[reqLineConsumed..];
         totalConsumed = reqLineConsumed;
+        bool hasTransferEncoding = false;
+        bool hasContentLength = false;
+        string? firstContentLength = null;
 
         while (headerSpan.Length > 0)
         {
             if (headerSpan.StartsWith("\r\n"u8))
             {
+                if (hasTransferEncoding && hasContentLength)
+                {
+                    return HeaderParseResult.Malformed;
+                }
                 totalConsumed += 2;
-                return true;
+                return HeaderParseResult.Valid;
             }
             if (headerSpan.StartsWith("\n"u8))
             {
-                totalConsumed += 1;
-                return true;
+                return HeaderParseResult.Malformed;
+            }
+            if (headerSpan.Length == 1 && headerSpan[0] == (byte)'\r')
+            {
+                return HeaderParseResult.Incomplete;
             }
 
             if (HttpSimdParser.TryParseHeader(headerSpan, out var hName, out var hVal, out int hConsumed))
             {
-                headers[Encoding.UTF8.GetString(hName)] = Encoding.UTF8.GetString(hVal);
+                string headerNameStr = Encoding.UTF8.GetString(hName);
+                string headerValueStr = Encoding.UTF8.GetString(hVal);
+
+                if (headerNameStr.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasTransferEncoding = true;
+                }
+                else if (headerNameStr.Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (firstContentLength is not null && !string.Equals(firstContentLength, headerValueStr, StringComparison.Ordinal))
+                    {
+                        return HeaderParseResult.Malformed;
+                    }
+                    firstContentLength ??= headerValueStr;
+                    hasContentLength = true;
+                }
+
+                if (hasTransferEncoding && hasContentLength)
+                {
+                    return HeaderParseResult.Malformed;
+                }
+
+                headers[headerNameStr] = headerValueStr;
                 totalConsumed += hConsumed;
                 headerSpan = span[totalConsumed..];
             }
             else
             {
-                break;
+                return HasCompleteOrInvalidLineEnding(headerSpan) ? HeaderParseResult.Malformed : HeaderParseResult.Incomplete;
             }
         }
 
-        return false;
+        return HeaderParseResult.Incomplete;
     }
 
     public void Stop()

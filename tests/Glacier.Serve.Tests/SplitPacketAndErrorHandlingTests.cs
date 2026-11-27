@@ -385,6 +385,36 @@ public sealed class SplitPacketAndErrorHandlingTests
         app.Stop();
     }
 
+    [Theory]
+    [InlineData("POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntest\r\n0\r\n\r\n")]
+    [InlineData("POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4\r\nContent-Length: 8\r\n\r\ntest")]
+    [InlineData("GET /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nBad Header : 1\r\n\r\n")]
+    [InlineData("GET /echo HTTP/1.1\r\nHost: 127.0.0.1\n\n")]
+    public async Task GlacierServeApp_RejectsHttpSmugglingAndMalformedHeaders_With400(string rawRequest)
+    {
+        int port = GetAvailablePort();
+        using var app = GlacierServeApp.CreateBuilder()
+            .UsePort(port)
+            .MapGet("/echo", ctx => ctx.Response.WriteUtf8Async("ok"))
+            .MapPost("/echo", ctx => ctx.Response.WriteUtf8Async("ok"))
+            .Build();
+
+        await app.StartAsync();
+
+        using var tcp = new TcpClient { NoDelay = true };
+        await tcp.ConnectAsync(IPAddress.Loopback, port);
+        await using var stream = tcp.GetStream();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+        await stream.WriteAsync(Encoding.ASCII.GetBytes(rawRequest), cts.Token);
+        await stream.FlushAsync(cts.Token);
+
+        var resp = await ReadRawHttpResponseAsync(stream, cts.Token);
+        Assert.Equal(400, resp.StatusCode);
+
+        app.Stop();
+    }
+
     private sealed class StubHttpMessageHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> _handler;

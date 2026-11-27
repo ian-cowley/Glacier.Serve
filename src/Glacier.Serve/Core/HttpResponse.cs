@@ -27,6 +27,7 @@ public sealed class HttpResponse
     public Dictionary<string, string> Headers { get; } = new(StringComparer.OrdinalIgnoreCase);
     public PipeWriter BodyWriter => _writer;
     public bool HeadersSent => _headersSent;
+    public bool UseChunkedTransfer { get; set; }
 
     public HttpResponse(PipeWriter writer)
     {
@@ -103,8 +104,9 @@ public sealed class HttpResponse
 
         ReadOnlySpan<byte> httpPrefix = "HTTP/1.1 "u8;
         ReadOnlySpan<byte> ctPrefix = "\r\nContent-Type: "u8;
-        ReadOnlySpan<byte> serverHeader = "\r\nServer: Glacier.Serve/1.8.0 (.NET 10)\r\n"u8;
+        ReadOnlySpan<byte> serverHeader = "\r\nServer: Glacier.Serve/1.9.0 (.NET 10)\r\n"u8;
         ReadOnlySpan<byte> clPrefix = "Content-Length: "u8;
+        ReadOnlySpan<byte> teChunked = "Transfer-Encoding: chunked\r\n"u8;
         ReadOnlySpan<byte> crlf = "\r\n"u8;
         ReadOnlySpan<byte> colonSpace = ": "u8;
 
@@ -125,6 +127,13 @@ public sealed class HttpResponse
             clPrefix.CopyTo(span[written..]); written += clPrefix.Length;
             Utf8Formatter.TryFormat(contentLength.Value, span[written..], out int clBytes); written += clBytes;
             crlf.CopyTo(span[written..]); written += crlf.Length;
+        }
+        else if (!Headers.ContainsKey("Content-Length") && !Headers.ContainsKey("Transfer-Encoding"))
+        {
+            if (UseChunkedTransfer)
+            {
+                teChunked.CopyTo(span[written..]); written += teChunked.Length;
+            }
         }
 
         foreach (var (k, v) in Headers)
@@ -226,6 +235,61 @@ public sealed class HttpResponse
         Span<byte> nl = _writer.GetSpan(1);
         nl[0] = (byte)'\n';
         _writer.Advance(1);
+        FlushResult flush = await _writer.FlushAsync(ct);
+        if (flush.IsCanceled)
+            throw new OperationCanceledException(ct);
+    }
+
+    /// <summary>
+    /// Writes a chunked HTTP/1.1 frame when <see cref="UseChunkedTransfer"/> is enabled.
+    /// Returns <see langword="false"/> if the downstream reader completed or cancelled.
+    /// </summary>
+    public async ValueTask<bool> WriteChunkAsync(ReadOnlyMemory<byte> payload, CancellationToken ct = default)
+    {
+        UseChunkedTransfer = true;
+        await EnsureHeadersSentAsync(null, ct);
+        if (!payload.IsEmpty)
+        {
+            Span<byte> prefix = stackalloc byte[32];
+            if (!Utf8Formatter.TryFormat(payload.Length, prefix, out int hexLen, new StandardFormat('X')))
+                throw new InvalidOperationException("Failed to format HTTP chunk length.");
+            prefix[hexLen++] = (byte)'\r';
+            prefix[hexLen++] = (byte)'\n';
+            await _writer.WriteAsync(prefix[..hexLen].ToArray(), ct);
+            await _writer.WriteAsync(payload, ct);
+            await _writer.WriteAsync("\r\n"u8.ToArray(), ct);
+        }
+
+        FlushResult flush = await _writer.FlushAsync(ct);
+        return !flush.IsCompleted && !flush.IsCanceled;
+    }
+
+    public async ValueTask CompleteChunkedAsync(CancellationToken ct = default)
+    {
+        if (!UseChunkedTransfer) return;
+        await EnsureHeadersSentAsync(null, ct);
+        await _writer.WriteAsync("0\r\n\r\n"u8.ToArray(), ct);
         await _writer.FlushAsync(ct);
+    }
+
+    public async ValueTask<bool> WriteSseEventAsync(ReadOnlyMemory<byte> sseFrameBytes, CancellationToken ct = default)
+    {
+        if (!_headersSent && !Headers.ContainsKey("Content-Length"))
+        {
+            UseChunkedTransfer = true;
+        }
+
+        if (UseChunkedTransfer)
+        {
+            return await WriteChunkAsync(sseFrameBytes, ct);
+        }
+
+        await EnsureHeadersSentAsync(null, ct);
+        if (!sseFrameBytes.IsEmpty)
+        {
+            await _writer.WriteAsync(sseFrameBytes, ct);
+        }
+        FlushResult flush = await _writer.FlushAsync(ct);
+        return !flush.IsCompleted && !flush.IsCanceled;
     }
 }

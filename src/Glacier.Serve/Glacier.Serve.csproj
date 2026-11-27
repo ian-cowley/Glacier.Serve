@@ -12,7 +12,7 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Serve</PackageId>
-    <Version>1.8.5</Version>
+    <Version>1.9.0</Version>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
     <Description>Ultra-low-latency, Native AOT web and LLM inference microservices engine for .NET 10. Features PagedAttention, Continuous Iteration Batching, SIMD HTTP delimiter scanning, zero-allocation Radix Tree routing, Glacier.Storage Arrow streaming, direct Polaris/Tensor streaming, and Autonomous Sleep Consolidation Daemons.</Description>
@@ -22,7 +22,7 @@
     <RepositoryType>git</RepositoryType>
     <PackageTags>http;web;api;vllm;ollama;paged-attention;continuous-batching;llm;inference;simd;radix-tree;arrow-ipc;storage;net10;aot;glacier;continual-learning;sleep</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <PackageReleaseNotes>v1.8.5: Fixes local monorepo NU1605 downgrade by conditionalizing Glacier.Tensor ProjectReference/PackageReference and aligns NuGet dependencies to Glacier.Inference v1.9.1, Glacier.Tune v1.6.0, and Glacier.Tensor v1.1.1.</PackageReleaseNotes>
+    <PackageReleaseNotes>v1.9.0: TLS termination, constant-time Bearer auth, connection admission cap (503), Slowloris header timeout (408), chunked SSE helpers, and aligned ecosystem deps.</PackageReleaseNotes>
     <IsAotCompatible>true</IsAotCompatible>
     <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
@@ -52,25 +52,25 @@
     <ProjectReference Include="../../../Glacier.Agent/src/Glacier.Agent/Glacier.Agent.csproj" Condition="Exists('../../../Glacier.Agent/src/Glacier.Agent/Glacier.Agent.csproj')" />
   </ItemGroup>
   <ItemGroup Condition="!Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') or '$(UseLocalProjectReferences)' == 'false'">
-    <PackageReference Include="Glacier.Formats" Version="1.0.0" />
-    <PackageReference Include="Glacier.Polaris" Version="1.2.5" />
-    <PackageReference Include="Glacier.Tensor" Version="1.1.1" />
-    <PackageReference Include="Glacier.Inference" Version="1.9.1" />
-    <PackageReference Include="Glacier.Rag" Version="1.4.2" />
-    <PackageReference Include="Glacier.Tune" Version="1.6.0" />
-    <PackageReference Include="Glacier.MemEx" Version="1.2.2" />
-    <PackageReference Include="Glacier.Agent" Version="1.5.2" />
+    <PackageReference Include="Glacier.Formats" Version="1.0.1" />
+    <PackageReference Include="Glacier.Polaris" Version="1.2.6" />
+    <PackageReference Include="Glacier.Tensor" Version="1.1.2" />
+    <PackageReference Include="Glacier.Inference" Version="1.10.1" />
+    <PackageReference Include="Glacier.Rag" Version="1.4.3" />
+    <PackageReference Include="Glacier.Tune" Version="1.7.0" />
+    <PackageReference Include="Glacier.MemEx" Version="1.2.3" />
+    <PackageReference Include="Glacier.Agent" Version="1.5.3" />
   </ItemGroup>
   <ItemGroup Condition="Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') and '$(UseLocalProjectReferences)' != 'false' and !Exists('../../../Glacier.Tensor/src/Glacier.Tensor/Glacier.Tensor.csproj')">
-    <PackageReference Include="Glacier.Tensor" Version="1.1.1" />
+    <PackageReference Include="Glacier.Tensor" Version="1.1.2" />
   </ItemGroup>
   <ItemGroup Condition="Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') and '$(UseLocalProjectReferences)' != 'false' and !Exists('../../../Glacier.Rag/src/Glacier.Rag/Glacier.Rag.csproj')">
-    <PackageReference Include="Glacier.Rag" Version="1.4.2" />
+    <PackageReference Include="Glacier.Rag" Version="1.4.3" />
   </ItemGroup>
   <ItemGroup Condition="Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') and '$(UseLocalProjectReferences)' != 'false' and !Exists('../../../Glacier.MemEx/src/Glacier.MemEx/Glacier.MemEx.csproj')">
-    <PackageReference Include="Glacier.MemEx" Version="1.2.2" />
+    <PackageReference Include="Glacier.MemEx" Version="1.2.3" />
   </ItemGroup>
   <ItemGroup Condition="Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') and '$(UseLocalProjectReferences)' != 'false' and !Exists('../../../Glacier.Agent/src/Glacier.Agent/Glacier.Agent.csproj')">
-    <PackageReference Include="Glacier.Agent" Version="1.5.2" />
+    <PackageReference Include="Glacier.Agent" Version="1.5.3" />
   </ItemGroup>
 </Project>

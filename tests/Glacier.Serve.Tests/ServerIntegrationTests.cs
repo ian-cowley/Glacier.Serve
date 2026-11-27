@@ -1,8 +1,14 @@
 namespace Glacier.Serve.Tests;
 
 using System;
+using System.IO;
+using System.Net;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
 using System.Text.Json.Serialization;
 using System.Threading.Tasks;
 using Glacier.Serve.Server;
@@ -74,5 +80,102 @@ public class ServerIntegrationTests
         // 4. 404
         var res4 = await client.GetAsync("/non-existent");
         Assert.Equal(System.Net.HttpStatusCode.NotFound, res4.StatusCode);
+    }
+
+    [Fact]
+    public async Task Server_BearerAuth_Enforces401AndPermitsExemptPaths()
+    {
+        int port = GetAvailablePort();
+        const string token = "test-bearer-secret-token";
+        using var app = GlacierServeApp.CreateBuilder()
+            .UsePort(port)
+            .UseBearerAuth(token, "/health")
+            .MapGet("/health", async ctx => await ctx.Response.WriteUtf8Async("ok"))
+            .MapGet("/secure", async ctx => await ctx.Response.WriteUtf8Async("secret-ok"))
+            .Build();
+
+        await app.StartAsync();
+        using var client = new HttpClient { BaseAddress = new Uri($"http://127.0.0.1:{port}") };
+
+        var healthRes = await client.GetAsync("/health");
+        Assert.Equal(HttpStatusCode.OK, healthRes.StatusCode);
+
+        var unauthRes = await client.GetAsync("/secure");
+        Assert.Equal(HttpStatusCode.Unauthorized, unauthRes.StatusCode);
+
+        using var badReq = new HttpRequestMessage(HttpMethod.Get, "/secure");
+        badReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", "wrong-token");
+        var badRes = await client.SendAsync(badReq);
+        Assert.Equal(HttpStatusCode.Unauthorized, badRes.StatusCode);
+
+        using var okReq = new HttpRequestMessage(HttpMethod.Get, "/secure");
+        okReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        var okRes = await client.SendAsync(okReq);
+        Assert.Equal(HttpStatusCode.OK, okRes.StatusCode);
+        Assert.Equal("secret-ok", await okRes.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
+    public async Task Server_HeaderTimeout_DropsSlowlorisClientAndFreesSlot()
+    {
+        int port = GetAvailablePort();
+        using var app = GlacierServeApp.CreateBuilder()
+            .UsePort(port)
+            .WithMaxConcurrentConnections(1)
+            .WithHeaderTimeout(TimeSpan.FromMilliseconds(200))
+            .MapGet("/ok", async ctx => await ctx.Response.WriteUtf8Async("ok"))
+            .Build();
+
+        await app.StartAsync();
+
+        using var slowClient = new TcpClient();
+        await slowClient.ConnectAsync(IPAddress.Loopback, port);
+        await slowClient.GetStream().WriteAsync("GET /ok HTTP/1.1\r\n"u8.ToArray());
+
+        // Second connection while first holds the single connection slot should get 503 immediately
+        using var handler = new HttpClientHandler { UseProxy = false };
+        using var http = new HttpClient(handler) { BaseAddress = new Uri($"http://127.0.0.1:{port}") };
+        var busyRes = await http.GetAsync("/ok");
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, busyRes.StatusCode);
+
+        // Wait past header timeout so Slowloris slot is released
+        await Task.Delay(350);
+        var recoveredRes = await http.GetAsync("/ok");
+        Assert.Equal(HttpStatusCode.OK, recoveredRes.StatusCode);
+    }
+
+    [Fact]
+    public async Task Server_TlsAndChunkedStreaming_CompletesHandshakeAndDecodesChunks()
+    {
+        using var rsa = RSA.Create(2048);
+        var req = new CertificateRequest("CN=localhost", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        using var ephemeralCert = req.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddHours(1));
+        byte[] pfxBytes = ephemeralCert.Export(X509ContentType.Pfx);
+        using var cert = X509CertificateLoader.LoadPkcs12(pfxBytes, ReadOnlySpan<char>.Empty, X509KeyStorageFlags.Exportable);
+
+        int port = GetAvailablePort();
+        using var app = GlacierServeApp.CreateBuilder()
+            .UsePort(port)
+            .UseTls(cert)
+            .MapGet("/stream", async ctx =>
+            {
+                ctx.Response.ContentType = "text/event-stream";
+                ctx.Response.UseChunkedTransfer = true;
+                await ctx.Response.WriteSseEventAsync("data: one\n\n"u8.ToArray());
+                await ctx.Response.WriteSseEventAsync("data: two\n\n"u8.ToArray());
+                await ctx.Response.CompleteChunkedAsync();
+            })
+            .Build();
+
+        await app.StartAsync();
+
+        using var handler = new HttpClientHandler
+        {
+            ServerCertificateCustomValidationCallback = (_, _, _, _) => true
+        };
+        using var client = new HttpClient(handler) { BaseAddress = new Uri($"https://127.0.0.1:{port}") };
+        string body = await client.GetStringAsync("/stream");
+        Assert.Contains("data: one", body);
+        Assert.Contains("data: two", body);
     }
 }
