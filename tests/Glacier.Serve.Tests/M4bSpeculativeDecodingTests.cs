@@ -43,11 +43,12 @@ public sealed class M4bSpeculativeDecodingTests
         Assert.Equal(3, bt.BlockCount);
         Assert.Equal(5, pool.FreeBlocksCount);
 
-        // Truncate to 4 tokens => releases blocks 2 and 1 (and evicts h1 from prefix cache)
+        // Truncate to 4 tokens => releases blocks 2 and 1 (block 1 moves to LRU cache while still free/reclaimable)
         bt.TruncateTo(4);
         Assert.Equal(4, bt.TokenCount);
         Assert.Equal(1, bt.BlockCount);
         Assert.Equal(7, pool.FreeBlocksCount);
+        Assert.Equal(1, pool.EvictPrefixCache());
         Assert.False(pool.TryFindPrefixBlock(h1, out _));
 
         // Bounds checks
@@ -128,6 +129,7 @@ public sealed class M4bSpeculativeDecodingTests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void CudaPagedTransformerRunner_VerifyDraftChunk_And_HiddenStateCaptureSemantics()
     {
         string tempDir = Path.Combine(Path.GetTempPath(), $"m4b_verify_cuda_{Guid.NewGuid():N}");
@@ -438,7 +440,7 @@ public sealed class M4bSpeculativeDecodingTests
                 var (st, str) = await highBatchEngine.EnqueueAsync(new InferenceRequest
                 {
                     Prompt = $"hello world alpha tok{16 + i}",
-                    MaxTokens = 20,
+                    MaxTokens = 48,
                     Temperature = 0.0f,
                     RepetitionPenalty = 1.0f
                 }, ct);
@@ -446,11 +448,9 @@ public sealed class M4bSpeculativeDecodingTests
                 tasks[i] = st.Completion.Task;
             }
 
-            // Wait until all 6 sequences (including #5) have emitted their first token while none have finished (MaxTokens=20)
-            for (int i = 0; i < 6; i++)
-            {
-                Assert.True(await streams[i].MoveNextAsync());
-            }
+            // Wait concurrently until all 6 sequences (including #5) have emitted their first token while none have finished (MaxTokens=48)
+            bool[] firstTokens = await Task.WhenAll(streams.Select(s => s.MoveNextAsync().AsTask()));
+            Assert.All(firstTokens, ok => Assert.True(ok));
 
             Assert.True(highBatchEngine.ActiveBatchSize > 4);
             Assert.False(highBatchEngine.IsSpeculativeDecodingActive);
@@ -754,7 +754,7 @@ public sealed class M4bSpeculativeDecodingTests
                 {
                     Model = modelName,
                     Prompt = $"hello world alpha tok{16 + i}",
-                    MaxTokens = 16,
+                    MaxTokens = 48,
                     Temperature = 0.0f,
                     RepetitionPenalty = 1.0f
                 }, "default", ct);
@@ -762,10 +762,8 @@ public sealed class M4bSpeculativeDecodingTests
                 tasks[i] = st.Completion.Task;
             }
 
-            for (int i = 0; i < 6; i++)
-            {
-                Assert.True(await streams[i].MoveNextAsync());
-            }
+            bool[] firstTokens = await Task.WhenAll(streams.Select(s => s.MoveNextAsync().AsTask()));
+            Assert.All(firstTokens, ok => Assert.True(ok));
 
             Assert.True(specEngine.ActiveBatchSize > 4);
             Assert.False(specEngine.IsSpeculativeDecodingActive);

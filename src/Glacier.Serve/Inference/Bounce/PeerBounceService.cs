@@ -1,6 +1,7 @@
 namespace Glacier.Serve.Inference.Bounce;
 
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
@@ -11,6 +12,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Glacier.Agent.Sandbox;
+using Glacier.Serve.Diagnostics;
 using Glacier.Serve.Inference.Batching;
 using Glacier.Serve.Serialization;
 
@@ -52,6 +54,7 @@ public sealed partial class SandboxedProcessBounceVerifier : IBounceVerifier
     private readonly string? _harnessExePath;
     private readonly ISandboxExecutor _sandbox;
     private readonly string _pythonExe;
+    private readonly bool _isCustomPythonExe;
     private readonly string _nodeExe;
     private readonly TimeSpan _harnessTimeout;
     private readonly TimeSpan _scriptTimeout;
@@ -60,8 +63,8 @@ public sealed partial class SandboxedProcessBounceVerifier : IBounceVerifier
     private readonly bool _allowNetwork;
     private readonly bool _enableNamespaceIsolation;
 
-    [GeneratedRegex(@"```[a-zA-Z0-9_+-]*\s*\r?\n(.*?)```", RegexOptions.Singleline)]
-    private static partial Regex AnyCodeBlockRegex();
+    [GeneratedRegex(@"```([^\r\n`]*)\r?\n(.*?)```", RegexOptions.Singleline)]
+    private static partial Regex FencedCodeBlockRegex();
 
     [GeneratedRegex(@"\[numthreads\([^\]]+\)\]\s*(?:\[[^\]]+\]\s*)*void\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", RegexOptions.Singleline)]
     private static partial Regex HlslEntryRegex();
@@ -131,6 +134,8 @@ public sealed partial class SandboxedProcessBounceVerifier : IBounceVerifier
         _harnessExePath = string.IsNullOrWhiteSpace(harnessExePath) ? null : harnessExePath;
         _sandbox = sandboxExecutor ?? new OsProcessSandbox();
         _pythonExe = string.IsNullOrWhiteSpace(pythonExe) ? "python" : pythonExe;
+        _isCustomPythonExe = !string.Equals(_pythonExe, "python", StringComparison.OrdinalIgnoreCase) &&
+                             !string.Equals(_pythonExe, "python3", StringComparison.OrdinalIgnoreCase);
         _nodeExe = string.IsNullOrWhiteSpace(nodeExe) ? "node" : nodeExe;
         _harnessTimeout = harnessTimeout ?? TimeSpan.FromSeconds(15);
         _scriptTimeout = scriptTimeout ?? TimeSpan.FromSeconds(8);
@@ -195,14 +200,25 @@ public sealed partial class SandboxedProcessBounceVerifier : IBounceVerifier
 
     public static string? ExtractCodeBlock(string text, params string[] langs)
     {
+        var matches = FencedCodeBlockRegex().Matches(text);
+        if (matches.Count == 0)
+            return null;
+
         foreach (string lang in langs)
         {
-            var matches = Regex.Matches(text, $@"```{Regex.Escape(lang)}\s*\r?\n(.*?)```", RegexOptions.Singleline | RegexOptions.IgnoreCase);
-            if (matches.Count > 0)
-                return matches[^1].Groups[1].Value.Trim();
+            for (int i = matches.Count - 1; i >= 0; i--)
+            {
+                string info = matches[i].Groups[1].Value.Trim();
+                int spaceIdx = info.IndexOfAny([' ', '\t']);
+                if (spaceIdx >= 0)
+                    info = info[..spaceIdx];
+
+                if (string.Equals(info, lang, StringComparison.OrdinalIgnoreCase))
+                    return matches[i].Groups[2].Value.Trim();
+            }
         }
-        var any = AnyCodeBlockRegex().Matches(text);
-        return any.Count > 0 ? any[^1].Groups[1].Value.Trim() : null;
+
+        return matches[^1].Groups[2].Value.Trim();
     }
 
     private static string DetectHlslEntry(string code)
@@ -219,15 +235,62 @@ public sealed partial class SandboxedProcessBounceVerifier : IBounceVerifier
             return new BounceVerificationResult(false, "Response must wrap valid JSON inside <tool_call>{...}</tool_call> tags.");
         try
         {
-            using var doc = JsonDocument.Parse(m.Groups[1].Value);
-            var root = doc.RootElement;
-            if (!root.TryGetProperty("name", out var nameProp) || nameProp.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(nameProp.GetString()))
-                return new BounceVerificationResult(false, "<tool_call> JSON must contain a non-empty string \"name\" field.");
-            if (!root.TryGetProperty("arguments", out var argsProp) || argsProp.ValueKind != JsonValueKind.Object)
-                return new BounceVerificationResult(false, "<tool_call> JSON must contain an object \"arguments\" field.");
-            return new BounceVerificationResult(true, null);
+            string json = m.Groups[1].Value;
+            int maxBytes = Encoding.UTF8.GetMaxByteCount(json.Length);
+            byte[]? rented = null;
+            Span<byte> utf8 = maxBytes <= 1024
+                ? stackalloc byte[1024]
+                : (rented = ArrayPool<byte>.Shared.Rent(maxBytes)).AsSpan(0, maxBytes);
+            try
+            {
+                int written = Encoding.UTF8.GetBytes(json, utf8);
+                var reader = new Utf8JsonReader(utf8[..written]);
+                if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject)
+                    return new BounceVerificationResult(false, "Invalid JSON inside <tool_call>: expected JSON object.");
+
+                bool hasValidName = false;
+                bool hasObjectArgs = false;
+
+                while (reader.Read())
+                {
+                    if (reader.TokenType == JsonTokenType.EndObject)
+                        break;
+
+                    if (reader.TokenType != JsonTokenType.PropertyName)
+                        continue;
+
+                    bool isName = reader.ValueTextEquals("name"u8);
+                    bool isArgs = reader.ValueTextEquals("arguments"u8);
+
+                    if (!reader.Read())
+                        break;
+
+                    if (isName)
+                    {
+                        hasValidName = reader.TokenType == JsonTokenType.String && !string.IsNullOrWhiteSpace(reader.GetString());
+                    }
+                    else if (isArgs)
+                    {
+                        hasObjectArgs = reader.TokenType == JsonTokenType.StartObject;
+                    }
+
+                    if (reader.TokenType is JsonTokenType.StartObject or JsonTokenType.StartArray)
+                        reader.Skip();
+                }
+
+                if (!hasValidName)
+                    return new BounceVerificationResult(false, "<tool_call> JSON must contain a non-empty string \"name\" field.");
+                if (!hasObjectArgs)
+                    return new BounceVerificationResult(false, "<tool_call> JSON must contain an object \"arguments\" field.");
+                return new BounceVerificationResult(true, null);
+            }
+            finally
+            {
+                if (rented != null)
+                    ArrayPool<byte>.Shared.Return(rented);
+            }
         }
-        catch (Exception ex)
+        catch (JsonException ex)
         {
             return new BounceVerificationResult(false, $"Invalid JSON inside <tool_call>: {ex.Message}");
         }
@@ -397,6 +460,11 @@ public sealed partial class SandboxedProcessBounceVerifier : IBounceVerifier
         {
             throw;
         }
+        catch (Exception ex) when (!_isCustomPythonExe && ex is Win32Exception or FileNotFoundException or InvalidOperationException)
+        {
+            GlacierDiagnostics.LogDebug($"[PeerBounceService] Python binary '{_pythonExe}' unavailable; using pure-C# Python syntax verifier: {ex.Message}");
+            return VerifyPythonSyntaxPureCSharp(code);
+        }
         catch (Exception ex)
         {
             return new BounceVerificationResult(false, $"Python syntax verifier '{_pythonExe}' unavailable or failed to launch: {ex.Message}");
@@ -405,6 +473,294 @@ public sealed partial class SandboxedProcessBounceVerifier : IBounceVerifier
         {
             CleanupTempDir(tempDir);
         }
+    }
+
+    internal static BounceVerificationResult VerifyPythonSyntaxPureCSharp(string code)
+    {
+        if (string.IsNullOrWhiteSpace(code))
+            return new BounceVerificationResult(false, "Python py_compile failed (lexical): empty code block.");
+
+        var delimiterStack = new Stack<(char Open, int Line)>();
+        var indentStack = new List<int> { 0 };
+        bool expectingIndentBlock = false;
+
+        bool inTripleSingle = false;
+        bool inTripleDouble = false;
+        bool inSingle = false;
+        bool inDouble = false;
+        bool lineContinuation = false;
+        int lineNumber = 0;
+
+        string normalized = code.Replace("\r\n", "\n", StringComparison.Ordinal).Replace("\r", "\n", StringComparison.Ordinal);
+        string[] lines = normalized.Split('\n');
+        int lineCount = (normalized.EndsWith('\n') && lines.Length > 0 && lines[^1].Length == 0)
+            ? lines.Length - 1
+            : lines.Length;
+        for (int li = 0; li < lineCount; li++)
+        {
+            lineNumber = li + 1;
+            string line = lines[li];
+
+            // Compute leading indentation only when not continuing a string, open bracket expression, or trailing '\'
+            if (!inTripleSingle && !inTripleDouble && !inSingle && !inDouble && delimiterStack.Count == 0 && !lineContinuation)
+            {
+                int indent = 0;
+                bool hasSpace = false;
+                bool hasTab = false;
+                int p = 0;
+                while (p < line.Length && (line[p] == ' ' || line[p] == '\t'))
+                {
+                    if (line[p] == ' ')
+                    {
+                        hasSpace = true;
+                        indent++;
+                    }
+                    else
+                    {
+                        hasTab = true;
+                        indent += 8;
+                    }
+                    p++;
+                }
+
+                bool isBlankOrComment = p >= line.Length || line[p] == '#';
+                if (!isBlankOrComment)
+                {
+                    if (hasSpace && hasTab)
+                        return new BounceVerificationResult(false, $"Python py_compile failed (lexical): inconsistent use of tabs and spaces in indentation at line {lineNumber}.");
+
+                    if (expectingIndentBlock)
+                    {
+                        if (indent <= indentStack[^1])
+                            return new BounceVerificationResult(false, $"Python py_compile failed (lexical): expected an indented block at line {lineNumber}.");
+                        indentStack.Add(indent);
+                        expectingIndentBlock = false;
+                    }
+                    else if (indent > indentStack[^1])
+                    {
+                        return new BounceVerificationResult(false, $"Python py_compile failed (lexical): unexpected indent at line {lineNumber}.");
+                    }
+                    else if (indent < indentStack[^1])
+                    {
+                        while (indentStack.Count > 1 && indent < indentStack[^1])
+                        {
+                            indentStack.RemoveAt(indentStack.Count - 1);
+                        }
+                        if (indent != indentStack[^1])
+                            return new BounceVerificationResult(false, $"Python py_compile failed (lexical): unindent does not match any outer indentation level at line {lineNumber}.");
+                    }
+                }
+            }
+
+            bool nextLineContinuation = false;
+            char lastNonWsChar = '\0';
+            int codeStartIdx = -1;
+
+            for (int ci = 0; ci < line.Length; ci++)
+            {
+                char ch = line[ci];
+
+                if (inTripleSingle)
+                {
+                    if (ch == '\\' && ci + 1 < line.Length) { ci++; continue; }
+                    if (ch == '\'' && ci + 2 < line.Length && line[ci + 1] == '\'' && line[ci + 2] == '\'')
+                    {
+                        inTripleSingle = false;
+                        ci += 2;
+                        lastNonWsChar = '\'';
+                    }
+                    continue;
+                }
+
+                if (inTripleDouble)
+                {
+                    if (ch == '\\' && ci + 1 < line.Length) { ci++; continue; }
+                    if (ch == '"' && ci + 2 < line.Length && line[ci + 1] == '"' && line[ci + 2] == '"')
+                    {
+                        inTripleDouble = false;
+                        ci += 2;
+                        lastNonWsChar = '"';
+                    }
+                    continue;
+                }
+
+                if (inSingle)
+                {
+                    if (ch == '\\')
+                    {
+                        if (ci + 1 < line.Length) { ci++; }
+                        else { nextLineContinuation = true; }
+                        continue;
+                    }
+                    if (ch == '\'')
+                    {
+                        inSingle = false;
+                        lastNonWsChar = '\'';
+                    }
+                    continue;
+                }
+
+                if (inDouble)
+                {
+                    if (ch == '\\')
+                    {
+                        if (ci + 1 < line.Length) { ci++; }
+                        else { nextLineContinuation = true; }
+                        continue;
+                    }
+                    if (ch == '"')
+                    {
+                        inDouble = false;
+                        lastNonWsChar = '"';
+                    }
+                    continue;
+                }
+
+                if (ch == '#')
+                    break;
+
+                if (ch is ' ' or '\t')
+                    continue;
+
+                if (codeStartIdx < 0)
+                    codeStartIdx = ci;
+
+                if (ch == '\'' && ci + 2 < line.Length && line[ci + 1] == '\'' && line[ci + 2] == '\'')
+                {
+                    inTripleSingle = true;
+                    ci += 2;
+                    continue;
+                }
+
+                if (ch == '"' && ci + 2 < line.Length && line[ci + 1] == '"' && line[ci + 2] == '"')
+                {
+                    inTripleDouble = true;
+                    ci += 2;
+                    continue;
+                }
+
+                if (ch == '\'')
+                {
+                    inSingle = true;
+                    continue;
+                }
+
+                if (ch == '"')
+                {
+                    inDouble = true;
+                    continue;
+                }
+
+                if (ch is '(' or '[' or '{')
+                {
+                    delimiterStack.Push((ch, lineNumber));
+                }
+                else if (ch is ')' or ']' or '}')
+                {
+                    if (delimiterStack.Count == 0)
+                        return new BounceVerificationResult(false, $"Python py_compile failed (lexical): unmatched '{ch}' at line {lineNumber}.");
+
+                    var (open, _) = delimiterStack.Pop();
+                    bool matches = (open == '(' && ch == ')') || (open == '[' && ch == ']') || (open == '{' && ch == '}');
+                    if (!matches)
+                        return new BounceVerificationResult(false, $"Python py_compile failed (lexical): closing '{ch}' does not match '{open}' at line {lineNumber}.");
+                }
+
+                if (ch == '\\')
+                {
+                    if (ci != line.Length - 1)
+                        return new BounceVerificationResult(false, $"Python py_compile failed (lexical): unexpected character after line continuation character at line {lineNumber}.");
+
+                    nextLineContinuation = true;
+                    lastNonWsChar = '\\';
+                    continue;
+                }
+
+                lastNonWsChar = ch;
+            }
+
+            if ((inSingle || inDouble) && !nextLineContinuation)
+                return new BounceVerificationResult(false, $"Python py_compile failed (lexical): unterminated string literal at line {lineNumber}.");
+
+            lineContinuation = nextLineContinuation;
+
+            if (!inTripleSingle && !inTripleDouble && !inSingle && !inDouble && delimiterStack.Count == 0 && codeStartIdx >= 0)
+            {
+                if (lastNonWsChar == ':')
+                {
+                    expectingIndentBlock = true;
+                }
+                else if (StartsWithPythonBlockKeyword(line.AsSpan(codeStartIdx)) && lastNonWsChar != '\\')
+                {
+                    // Multi-line header only valid if brackets were left open (already checked Count == 0)
+                    // or an inline suite follows ':' on the same line
+                    if (!ContainsColonOutsideQuotes(line.AsSpan(codeStartIdx)))
+                        return new BounceVerificationResult(false, $"Python py_compile failed (lexical): expected ':' at end of block statement on line {lineNumber}.");
+                }
+            }
+        }
+
+        if (inTripleSingle || inTripleDouble)
+            return new BounceVerificationResult(false, "Python py_compile failed (lexical): unterminated triple-quoted string literal.");
+
+        if (inSingle || inDouble)
+            return new BounceVerificationResult(false, $"Python py_compile failed (lexical): unterminated string literal at line {lineNumber}.");
+
+        if (lineContinuation)
+            return new BounceVerificationResult(false, $"Python py_compile failed (lexical): unexpected EOF after line continuation at line {lineNumber}.");
+
+        if (delimiterStack.Count > 0)
+        {
+            var (open, openLine) = delimiterStack.Peek();
+            return new BounceVerificationResult(false, $"Python py_compile failed (lexical): '{open}' at line {openLine} was never closed.");
+        }
+
+        if (expectingIndentBlock)
+            return new BounceVerificationResult(false, $"Python py_compile failed (lexical): expected an indented block after line {lineNumber}.");
+
+        return new BounceVerificationResult(true, null);
+    }
+
+    private static bool StartsWithPythonBlockKeyword(ReadOnlySpan<char> trimmed)
+    {
+        return MatchesKeyword(trimmed, "def") ||
+               MatchesKeyword(trimmed, "class") ||
+               MatchesKeyword(trimmed, "if") ||
+               MatchesKeyword(trimmed, "elif") ||
+               MatchesKeyword(trimmed, "else") ||
+               MatchesKeyword(trimmed, "for") ||
+               MatchesKeyword(trimmed, "while") ||
+               MatchesKeyword(trimmed, "try") ||
+               MatchesKeyword(trimmed, "except") ||
+               MatchesKeyword(trimmed, "finally") ||
+               MatchesKeyword(trimmed, "with") ||
+               MatchesKeyword(trimmed, "async");
+    }
+
+    private static bool MatchesKeyword(ReadOnlySpan<char> span, string kw)
+    {
+        if (!span.StartsWith(kw, StringComparison.Ordinal))
+            return false;
+        if (span.Length == kw.Length)
+            return true;
+        char next = span[kw.Length];
+        return next is ' ' or '\t' or '(' or ':';
+    }
+
+    private static bool ContainsColonOutsideQuotes(ReadOnlySpan<char> span)
+    {
+        bool inS = false, inD = false;
+        for (int i = 0; i < span.Length; i++)
+        {
+            char c = span[i];
+            if (inS) { if (c == '\\') i++; else if (c == '\'') inS = false; continue; }
+            if (inD) { if (c == '\\') i++; else if (c == '"') inD = false; continue; }
+            if (c == '#') break;
+            if (c == '\'') inS = true;
+            else if (c == '"') inD = true;
+            else if (c == ':') return true;
+        }
+        return false;
     }
 
     private async Task<BounceVerificationResult> RunHarnessAsync(
@@ -433,14 +789,17 @@ public sealed partial class SandboxedProcessBounceVerifier : IBounceVerifier
             string detail = res.StandardOutput;
             try
             {
-                using var doc = JsonDocument.Parse(res.StandardOutput);
-                string? diag = doc.RootElement.TryGetProperty("diagnostic_id", out var d) ? d.GetString() : null;
-                string? err = doc.RootElement.TryGetProperty("error", out var e) ? e.GetString() : null;
-                if (!string.IsNullOrWhiteSpace(err))
-                    detail = string.IsNullOrWhiteSpace(diag) ? err : $"{diag}: {err}";
+                var diagPayload = JsonSerializer.Deserialize(res.StandardOutput, ServeJsonContext.Default.HarnessDiagnosticPayload);
+                if (diagPayload != null && !string.IsNullOrWhiteSpace(diagPayload.Error))
+                {
+                    detail = string.IsNullOrWhiteSpace(diagPayload.DiagnosticId)
+                        ? diagPayload.Error
+                        : $"{diagPayload.DiagnosticId}: {diagPayload.Error}";
+                }
             }
-            catch
+            catch (JsonException ex)
             {
+                GlacierDiagnostics.LogDebug($"[PeerBounceService] Harness diagnostic output was not JSON: {ex.Message}");
                 if (string.IsNullOrWhiteSpace(detail)) detail = res.StandardError;
             }
             if (string.IsNullOrWhiteSpace(detail)) detail = "Compiler verification failed.";
@@ -503,8 +862,9 @@ public sealed partial class SandboxedProcessBounceVerifier : IBounceVerifier
                 Directory.Delete(dir, recursive: true);
             }
         }
-        catch
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
+            GlacierDiagnostics.LogDebug($"[PeerBounceService] Temp directory cleanup skipped for '{dir}': {ex.Message}");
         }
     }
 }
@@ -906,10 +1266,10 @@ public sealed partial class PeerBounceService
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             cts.CancelAfter(TimeSpan.FromSeconds(5));
             string json = await _http.GetStringAsync($"{endpoint}/v1/models", cts.Token).ConfigureAwait(false);
-            using var doc = JsonDocument.Parse(json);
-            if (doc.RootElement.TryGetProperty("data", out var arr) && arr.ValueKind == JsonValueKind.Array && arr.GetArrayLength() > 0)
+            var models = JsonSerializer.Deserialize(json, ServeJsonContext.Default.ModelListResponse);
+            if (models?.Data is { Count: > 0 })
             {
-                string? id = arr[0].TryGetProperty("id", out var idProp) ? idProp.GetString() : null;
+                string? id = models.Data[0].Id;
                 if (!string.IsNullOrWhiteSpace(id))
                 {
                     if (isCritic) Volatile.Write(ref _cachedCriticModel, id);
@@ -922,9 +1282,9 @@ public sealed partial class PeerBounceService
         {
             throw;
         }
-        catch
+        catch (Exception ex)
         {
-            // Fallback to caller-provided or default model id
+            GlacierDiagnostics.LogDebug($"[PeerBounceService] Model resolution fallback for '{endpoint}': {ex.Message}");
         }
 
         return string.IsNullOrWhiteSpace(fallback) ? "glacier-primary" : fallback;
@@ -963,24 +1323,21 @@ public sealed partial class PeerBounceService
         string body = await resp.Content.ReadAsStringAsync(cts.Token).ConfigureAwait(false);
         resp.EnsureSuccessStatusCode();
 
-        using var doc = JsonDocument.Parse(body);
-        var root = doc.RootElement;
+        var completion = JsonSerializer.Deserialize(body, ServeJsonContext.Default.ChatCompletionResponse);
         string content = "";
         string finish = "stop";
         int pTok = 0, cTok = 0;
 
-        if (root.TryGetProperty("choices", out var choices) && choices.ValueKind == JsonValueKind.Array && choices.GetArrayLength() > 0)
+        if (completion?.Choices is { Count: > 0 })
         {
-            var ch = choices[0];
-            if (ch.TryGetProperty("message", out var msg) && msg.TryGetProperty("content", out var cProp))
-                content = cProp.GetString() ?? "";
-            if (ch.TryGetProperty("finish_reason", out var fProp))
-                finish = fProp.GetString() ?? "stop";
+            var ch = completion.Choices[0];
+            content = ch.Message?.Content ?? "";
+            finish = string.IsNullOrEmpty(ch.FinishReason) ? "stop" : ch.FinishReason;
         }
-        if (root.TryGetProperty("usage", out var usage))
+        if (completion?.Usage != null)
         {
-            if (usage.TryGetProperty("prompt_tokens", out var pt)) pTok = pt.GetInt32();
-            if (usage.TryGetProperty("completion_tokens", out var ctProp)) cTok = ctProp.GetInt32();
+            pTok = completion.Usage.PromptTokens;
+            cTok = completion.Usage.CompletionTokens;
         }
 
         return (content, finish, pTok, cTok);

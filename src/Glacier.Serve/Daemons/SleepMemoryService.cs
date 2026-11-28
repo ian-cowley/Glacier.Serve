@@ -161,9 +161,9 @@ public sealed partial class SleepMemoryService : IDisposable, IAsyncDisposable
     {
     }
 
-    public SleepMemoryService(SleepMemoryOptions options)
+    public SleepMemoryService(SleepMemoryOptions? options = null)
     {
-        ArgumentNullException.ThrowIfNull(options);
+        options ??= new SleepMemoryOptions();
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(options.TokenBudget, 0);
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(options.MinDreamsToTriggerSleep, 0);
         ArgumentOutOfRangeException.ThrowIfNegative(options.EmbeddingDimensions);
@@ -665,8 +665,9 @@ public sealed partial class SleepMemoryService : IDisposable, IAsyncDisposable
             {
                 _sleepGate.Release();
             }
-            catch (ObjectDisposedException)
+            catch (ObjectDisposedException ex)
             {
+                Glacier.Serve.Diagnostics.GlacierDiagnostics.LogDebug($"[SleepMemoryService] Sleep gate already disposed: {ex.Message}");
             }
         }
     }
@@ -1280,8 +1281,9 @@ public sealed partial class SleepMemoryService : IDisposable, IAsyncDisposable
                 {
                     _embedGate.Release();
                 }
-                catch (ObjectDisposedException)
+                catch (ObjectDisposedException ex)
                 {
+                    Glacier.Serve.Diagnostics.GlacierDiagnostics.LogDebug($"[SleepMemoryService] Embed gate already disposed: {ex.Message}");
                 }
             }
         }
@@ -1970,7 +1972,11 @@ public sealed partial class SleepMemoryService : IDisposable, IAsyncDisposable
     public void Dispose()
     {
         if (!TryBeginDispose(out Task drainTask)) return;
-        try { _disposeCts.Cancel(); } catch (ObjectDisposedException) { }
+        try { _disposeCts.Cancel(); }
+        catch (ObjectDisposedException ex)
+        {
+            Glacier.Serve.Diagnostics.GlacierDiagnostics.LogDebug($"[SleepMemoryService] Dispose CTS already disposed: {ex.Message}");
+        }
         drainTask.GetAwaiter().GetResult();
         _daemon.Dispose();
         lock (_bankSync)
@@ -1988,7 +1994,11 @@ public sealed partial class SleepMemoryService : IDisposable, IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         if (!TryBeginDispose(out Task drainTask)) return;
-        try { _disposeCts.Cancel(); } catch (ObjectDisposedException) { }
+        try { _disposeCts.Cancel(); }
+        catch (ObjectDisposedException ex)
+        {
+            Glacier.Serve.Diagnostics.GlacierDiagnostics.LogDebug($"[SleepMemoryService] DisposeAsync CTS already disposed: {ex.Message}");
+        }
         await drainTask.ConfigureAwait(false);
         await _daemon.DisposeAsync().ConfigureAwait(false);
         lock (_bankSync)

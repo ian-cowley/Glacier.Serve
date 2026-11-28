@@ -5,7 +5,9 @@ using System.Buffers;
 using System.Buffers.Text;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.IO.Pipelines;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization.Metadata;
@@ -21,6 +23,9 @@ public sealed class HttpResponse
 
     private readonly PipeWriter _writer;
     private bool _headersSent;
+    private bool _chunkedCompleted;
+
+    internal Action? OnWriteAborted { get; set; }
 
     public int StatusCode { get; set; } = 200;
     public string ContentType { get; set; } = "text/plain; charset=utf-8";
@@ -34,7 +39,7 @@ public sealed class HttpResponse
         _writer = writer;
     }
 
-    private static ArrayBufferWriter<byte> RentJsonBuffer()
+    internal static ArrayBufferWriter<byte> RentJsonBuffer()
     {
         if (s_jsonBufferPool.TryDequeue(out var writer))
         {
@@ -45,7 +50,7 @@ public sealed class HttpResponse
         return new ArrayBufferWriter<byte>(1024);
     }
 
-    private static void ReturnJsonBuffer(ArrayBufferWriter<byte> writer)
+    internal static void ReturnJsonBuffer(ArrayBufferWriter<byte> writer)
     {
         if (writer.Capacity > MaxPooledBufferCapacity)
             return;
@@ -98,6 +103,7 @@ public sealed class HttpResponse
             429 => "Too Many Requests",
             431 => "Request Header Fields Too Large",
             500 => "Internal Server Error",
+            501 => "Not Implemented",
             503 => "Service Unavailable",
             _ => "Status"
         };
@@ -161,7 +167,38 @@ public sealed class HttpResponse
 
         crlf.CopyTo(span[written..]); written += crlf.Length;
         _writer.Advance(written);
-        await _writer.FlushAsync(ct);
+        await FlushWriterAsync(ct);
+    }
+
+    private async ValueTask WritePayloadAsync(ReadOnlyMemory<byte> payload, CancellationToken ct)
+    {
+        try
+        {
+            await _writer.WriteAsync(payload, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or SocketException or OperationCanceledException)
+        {
+            OnWriteAborted?.Invoke();
+            throw;
+        }
+    }
+
+    private async ValueTask<FlushResult> FlushWriterAsync(CancellationToken ct)
+    {
+        try
+        {
+            FlushResult flush = await _writer.FlushAsync(ct).ConfigureAwait(false);
+            if (flush.IsCompleted || flush.IsCanceled)
+            {
+                OnWriteAborted?.Invoke();
+            }
+            return flush;
+        }
+        catch (Exception ex) when (ex is IOException or SocketException or OperationCanceledException)
+        {
+            OnWriteAborted?.Invoke();
+            throw;
+        }
     }
 
     public async ValueTask WriteUtf8Async(string text, CancellationToken ct = default)
@@ -174,7 +211,7 @@ public sealed class HttpResponse
             int written = Encoding.UTF8.GetBytes(text, dest);
             _writer.Advance(written);
         }
-        await _writer.FlushAsync(ct);
+        await FlushWriterAsync(ct);
     }
 
     public async ValueTask WriteBytesAsync(ReadOnlyMemory<byte> bytes, CancellationToken ct = default)
@@ -182,9 +219,9 @@ public sealed class HttpResponse
         await EnsureHeadersSentAsync(bytes.Length, ct);
         if (!bytes.IsEmpty)
         {
-            await _writer.WriteAsync(bytes, ct);
+            await WritePayloadAsync(bytes, ct);
         }
-        await _writer.FlushAsync(ct);
+        await FlushWriterAsync(ct);
     }
 
     /// <summary>
@@ -208,7 +245,7 @@ public sealed class HttpResponse
             await EnsureHeadersSentAsync(payload.Length, ct);
             if (!payload.IsEmpty)
             {
-                await _writer.WriteAsync(payload, ct);
+                await WritePayloadAsync(payload, ct);
             }
         }
         finally
@@ -216,16 +253,41 @@ public sealed class HttpResponse
             ReturnJsonBuffer(buffer);
         }
 
-        await _writer.FlushAsync(ct);
+        await FlushWriterAsync(ct);
     }
 
     /// <summary>
     /// Writes a single NDJSON line directly into <see cref="BodyWriter"/> via <see cref="Utf8JsonWriter"/>
-    /// with zero intermediate <c>byte[]</c> allocations.
+    /// with zero intermediate <c>byte[]</c> allocations, respecting <see cref="UseChunkedTransfer"/>.
     /// </summary>
     public async ValueTask WriteNdjsonLineAsync<T>(T value, JsonTypeInfo<T> jsonTypeInfo, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(jsonTypeInfo);
+        if (UseChunkedTransfer)
+        {
+            var buffer = RentJsonBuffer();
+            try
+            {
+                using (var jsonWriter = new Utf8JsonWriter(buffer))
+                {
+                    JsonSerializer.Serialize(jsonWriter, value, jsonTypeInfo);
+                }
+
+                Span<byte> nlSpan = buffer.GetSpan(1);
+                nlSpan[0] = (byte)'\n';
+                buffer.Advance(1);
+
+                bool ok = await WriteChunkAsync(buffer.WrittenMemory, ct);
+                if (!ok)
+                    throw new OperationCanceledException(ct);
+            }
+            finally
+            {
+                ReturnJsonBuffer(buffer);
+            }
+            return;
+        }
+
         await EnsureHeadersSentAsync(null, ct);
         using (var jsonWriter = new Utf8JsonWriter(_writer))
         {
@@ -235,7 +297,7 @@ public sealed class HttpResponse
         Span<byte> nl = _writer.GetSpan(1);
         nl[0] = (byte)'\n';
         _writer.Advance(1);
-        FlushResult flush = await _writer.FlushAsync(ct);
+        FlushResult flush = await FlushWriterAsync(ct);
         if (flush.IsCanceled)
             throw new OperationCanceledException(ct);
     }
@@ -250,26 +312,44 @@ public sealed class HttpResponse
         await EnsureHeadersSentAsync(null, ct);
         if (!payload.IsEmpty)
         {
-            Span<byte> prefix = stackalloc byte[32];
-            if (!Utf8Formatter.TryFormat(payload.Length, prefix, out int hexLen, new StandardFormat('X')))
+            Span<byte> headerSpan = _writer.GetSpan(32);
+            if (!Utf8Formatter.TryFormat(payload.Length, headerSpan, out int hexLen, new StandardFormat('X')))
                 throw new InvalidOperationException("Failed to format HTTP chunk length.");
-            prefix[hexLen++] = (byte)'\r';
-            prefix[hexLen++] = (byte)'\n';
-            await _writer.WriteAsync(prefix[..hexLen].ToArray(), ct);
-            await _writer.WriteAsync(payload, ct);
-            await _writer.WriteAsync("\r\n"u8.ToArray(), ct);
+            headerSpan[hexLen++] = (byte)'\r';
+            headerSpan[hexLen++] = (byte)'\n';
+            _writer.Advance(hexLen);
+
+            if (payload.Length <= 4096)
+            {
+                Span<byte> dst = _writer.GetSpan(payload.Length + 2);
+                payload.Span.CopyTo(dst);
+                dst[payload.Length] = (byte)'\r';
+                dst[payload.Length + 1] = (byte)'\n';
+                _writer.Advance(payload.Length + 2);
+            }
+            else
+            {
+                await WritePayloadAsync(payload, ct);
+                Span<byte> tail = _writer.GetSpan(2);
+                tail[0] = (byte)'\r';
+                tail[1] = (byte)'\n';
+                _writer.Advance(2);
+            }
         }
 
-        FlushResult flush = await _writer.FlushAsync(ct);
+        FlushResult flush = await FlushWriterAsync(ct);
         return !flush.IsCompleted && !flush.IsCanceled;
     }
 
     public async ValueTask CompleteChunkedAsync(CancellationToken ct = default)
     {
-        if (!UseChunkedTransfer) return;
+        if (!UseChunkedTransfer || _chunkedCompleted) return;
+        _chunkedCompleted = true;
         await EnsureHeadersSentAsync(null, ct);
-        await _writer.WriteAsync("0\r\n\r\n"u8.ToArray(), ct);
-        await _writer.FlushAsync(ct);
+        Span<byte> term = _writer.GetSpan(5);
+        "0\r\n\r\n"u8.CopyTo(term);
+        _writer.Advance(5);
+        await FlushWriterAsync(ct);
     }
 
     public async ValueTask<bool> WriteSseEventAsync(ReadOnlyMemory<byte> sseFrameBytes, CancellationToken ct = default)
@@ -287,9 +367,9 @@ public sealed class HttpResponse
         await EnsureHeadersSentAsync(null, ct);
         if (!sseFrameBytes.IsEmpty)
         {
-            await _writer.WriteAsync(sseFrameBytes, ct);
+            await WritePayloadAsync(sseFrameBytes, ct);
         }
-        FlushResult flush = await _writer.FlushAsync(ct);
+        FlushResult flush = await FlushWriterAsync(ct);
         return !flush.IsCompleted && !flush.IsCanceled;
     }
 }

@@ -237,6 +237,7 @@ public sealed class M4bQuantizedKvCacheTests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void CudaPagedTransformerRunner_SupportsQuantizedKv_AndFallsBackCleanlyForFp32Fp8()
     {
         string tempDir = Path.Combine(Path.GetTempPath(), $"m4b_cuda_kv_{Guid.NewGuid():N}");
@@ -389,6 +390,7 @@ public sealed class M4bQuantizedKvCacheTests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public async Task ContinuousBatchEngine_GpuQuantizedKv_Q8_0_And_Q4_0_GenerateValidOutput()
     {
         string tempDir = Path.Combine(Path.GetTempPath(), $"m4b_engine_gpukv_{Guid.NewGuid():N}");

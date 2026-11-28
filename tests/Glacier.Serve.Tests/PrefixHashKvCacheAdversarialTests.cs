@@ -299,10 +299,13 @@ public unsafe class PrefixHashKvCacheAdversarialTests
         Assert.Equal(lastBoundBlock, finalFound);
         pool.ReleaseBlock(finalFound); // Release find ref
 
-        // Now release the last bound block
+        // Now release the last bound block: retained in LRU cache while counting toward FreeBlocksCount
         pool.ReleaseBlock(lastBoundBlock);
+        Assert.Equal(numBlocks, pool.FreeBlocksCount);
+        Assert.Equal(1, pool.CachedPrefixBlocksCount);
 
-        // Now cache lookup should return false
+        // Explicit eviction purges LRU entry cleanly
+        Assert.Equal(1, pool.EvictPrefixCache());
         Assert.False(pool.TryFindPrefixBlock(commonHash, out int nonexistent));
         Assert.Equal(-1, nonexistent);
         Assert.Equal(numBlocks, pool.FreeBlocksCount);
@@ -426,11 +429,14 @@ public unsafe class PrefixHashKvCacheAdversarialTests
         Assert.Equal(1, pool.GetRefCount(sharedB0));
         Assert.Equal(1, pool.GetRefCount(sharedB1));
 
-        // 6. Release initial binding references
+        // 6. Release initial binding references: both blocks stay cached in LRU while all 16 blocks report free/evictable
         pool.ReleaseBlock(sharedB0);
         pool.ReleaseBlock(sharedB1);
+        Assert.Equal(16, pool.FreeBlocksCount);
+        Assert.Equal(2, pool.CachedPrefixBlocksCount);
 
-        // Prefix map purged, all blocks free
+        // Evicting prefix cache clears both LRU entries
+        Assert.Equal(2, pool.EvictPrefixCache());
         Assert.False(pool.TryFindPrefixBlock(hash0, out _));
         Assert.False(pool.TryFindPrefixBlock(hash1, out _));
         Assert.Equal(16, pool.FreeBlocksCount);

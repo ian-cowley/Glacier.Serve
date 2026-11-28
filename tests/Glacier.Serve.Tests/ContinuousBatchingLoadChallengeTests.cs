@@ -534,6 +534,7 @@ public class ContinuousBatchingLoadChallengeTests
     /// Verifies zero data races, zero deadlock, proper block recycling, and output integrity.
     /// </summary>
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public async Task Challenge_LiveModel_ConcurrentHeterogeneousSequences_Execution()
     {
         string? modelPath = RealModelPath;

@@ -37,40 +37,33 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="System.IO.Hashing" Version="10.0.12" />
-    <PackageReference Include="System.Security.Cryptography.Pkcs" Version="10.0.14" />
+    <PackageReference Include="System.IO.Hashing" />
+    <PackageReference Include="System.Security.Cryptography.Pkcs" />
   </ItemGroup>
 
-  <ItemGroup Condition="Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') and '$(UseLocalProjectReferences)' != 'false'">
-    <ProjectReference Include="../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj" />
-    <ProjectReference Include="../../../Glacier.Polaris/src/Glacier.Polaris/Glacier.Polaris.csproj" />
-    <ProjectReference Include="../../../Glacier.Tensor/src/Glacier.Tensor/Glacier.Tensor.csproj" Condition="Exists('../../../Glacier.Tensor/src/Glacier.Tensor/Glacier.Tensor.csproj')" />
-    <ProjectReference Include="../../../Glacier.Inference/src/Glacier.Inference/Glacier.Inference.csproj" />
-    <ProjectReference Include="../../../Glacier.Rag/src/Glacier.Rag/Glacier.Rag.csproj" Condition="Exists('../../../Glacier.Rag/src/Glacier.Rag/Glacier.Rag.csproj')" />
-    <ProjectReference Include="../../../Glacier.Tune/src/Glacier.Tune/Glacier.Tune.csproj" Condition="Exists('../../../Glacier.Tune/src/Glacier.Tune/Glacier.Tune.csproj')" />
-    <ProjectReference Include="../../../Glacier.MemEx/src/Glacier.MemEx/Glacier.MemEx.csproj" Condition="Exists('../../../Glacier.MemEx/src/Glacier.MemEx/Glacier.MemEx.csproj')" />
-    <ProjectReference Include="../../../Glacier.Agent/src/Glacier.Agent/Glacier.Agent.csproj" Condition="Exists('../../../Glacier.Agent/src/Glacier.Agent/Glacier.Agent.csproj')" />
-  </ItemGroup>
-  <ItemGroup Condition="!Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') or '$(UseLocalProjectReferences)' == 'false'">
-    <PackageReference Include="Glacier.Formats" Version="1.0.1" />
-    <PackageReference Include="Glacier.Polaris" Version="1.2.6" />
-    <PackageReference Include="Glacier.Tensor" Version="1.1.2" />
-    <PackageReference Include="Glacier.Inference" Version="1.10.1" />
-    <PackageReference Include="Glacier.Rag" Version="1.4.3" />
-    <PackageReference Include="Glacier.Tune" Version="1.7.0" />
-    <PackageReference Include="Glacier.MemEx" Version="1.2.3" />
-    <PackageReference Include="Glacier.Agent" Version="1.5.3" />
-  </ItemGroup>
-  <ItemGroup Condition="Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') and '$(UseLocalProjectReferences)' != 'false' and !Exists('../../../Glacier.Tensor/src/Glacier.Tensor/Glacier.Tensor.csproj')">
-    <PackageReference Include="Glacier.Tensor" Version="1.1.2" />
-  </ItemGroup>
-  <ItemGroup Condition="Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') and '$(UseLocalProjectReferences)' != 'false' and !Exists('../../../Glacier.Rag/src/Glacier.Rag/Glacier.Rag.csproj')">
-    <PackageReference Include="Glacier.Rag" Version="1.4.3" />
-  </ItemGroup>
-  <ItemGroup Condition="Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') and '$(UseLocalProjectReferences)' != 'false' and !Exists('../../../Glacier.MemEx/src/Glacier.MemEx/Glacier.MemEx.csproj')">
-    <PackageReference Include="Glacier.MemEx" Version="1.2.3" />
-  </ItemGroup>
-  <ItemGroup Condition="Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') and '$(UseLocalProjectReferences)' != 'false' and !Exists('../../../Glacier.Agent/src/Glacier.Agent/Glacier.Agent.csproj')">
-    <PackageReference Include="Glacier.Agent" Version="1.5.3" />
+  <ItemGroup>
+    <ProjectReference Include="../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj" Condition="Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') and '$(UseLocalProjectReferences)' != 'false'" />
+    <PackageReference Include="Glacier.Formats" Condition="!Exists('../../../Glacier.Formats/src/Glacier.Formats/Glacier.Formats.csproj') or '$(UseLocalProjectReferences)' == 'false'" />
+
+    <ProjectReference Include="../../../Glacier.Polaris/src/Glacier.Polaris/Glacier.Polaris.csproj" Condition="Exists('../../../Glacier.Polaris/src/Glacier.Polaris/Glacier.Polaris.csproj') and '$(UseLocalProjectReferences)' != 'false'" />
+    <PackageReference Include="Glacier.Polaris" Condition="!Exists('../../../Glacier.Polaris/src/Glacier.Polaris/Glacier.Polaris.csproj') or '$(UseLocalProjectReferences)' == 'false'" />
+
+    <ProjectReference Include="../../../Glacier.Tensor/src/Glacier.Tensor/Glacier.Tensor.csproj" Condition="Exists('../../../Glacier.Tensor/src/Glacier.Tensor/Glacier.Tensor.csproj') and '$(UseLocalProjectReferences)' != 'false'" />
+    <PackageReference Include="Glacier.Tensor" Condition="!Exists('../../../Glacier.Tensor/src/Glacier.Tensor/Glacier.Tensor.csproj') or '$(UseLocalProjectReferences)' == 'false'" />
+
+    <ProjectReference Include="../../../Glacier.Inference/src/Glacier.Inference/Glacier.Inference.csproj" Condition="Exists('../../../Glacier.Inference/src/Glacier.Inference/Glacier.Inference.csproj') and '$(UseLocalProjectReferences)' != 'false'" />
+    <PackageReference Include="Glacier.Inference" Condition="!Exists('../../../Glacier.Inference/src/Glacier.Inference/Glacier.Inference.csproj') or '$(UseLocalProjectReferences)' == 'false'" />
+
+    <ProjectReference Include="../../../Glacier.Rag/src/Glacier.Rag/Glacier.Rag.csproj" Condition="Exists('../../../Glacier.Rag/src/Glacier.Rag/Glacier.Rag.csproj') and '$(UseLocalProjectReferences)' != 'false'" />
+    <PackageReference Include="Glacier.Rag" Condition="!Exists('../../../Glacier.Rag/src/Glacier.Rag/Glacier.Rag.csproj') or '$(UseLocalProjectReferences)' == 'false'" />
+
+    <ProjectReference Include="../../../Glacier.Tune/src/Glacier.Tune/Glacier.Tune.csproj" Condition="Exists('../../../Glacier.Tune/src/Glacier.Tune/Glacier.Tune.csproj') and '$(UseLocalProjectReferences)' != 'false'" />
+    <PackageReference Include="Glacier.Tune" Condition="!Exists('../../../Glacier.Tune/src/Glacier.Tune/Glacier.Tune.csproj') or '$(UseLocalProjectReferences)' == 'false'" />
+
+    <ProjectReference Include="../../../Glacier.MemEx/src/Glacier.MemEx/Glacier.MemEx.csproj" Condition="Exists('../../../Glacier.MemEx/src/Glacier.MemEx/Glacier.MemEx.csproj') and '$(UseLocalProjectReferences)' != 'false'" />
+    <PackageReference Include="Glacier.MemEx" Condition="!Exists('../../../Glacier.MemEx/src/Glacier.MemEx/Glacier.MemEx.csproj') or '$(UseLocalProjectReferences)' == 'false'" />
+
+    <ProjectReference Include="../../../Glacier.Agent/src/Glacier.Agent/Glacier.Agent.csproj" Condition="Exists('../../../Glacier.Agent/src/Glacier.Agent/Glacier.Agent.csproj') and '$(UseLocalProjectReferences)' != 'false'" />
+    <PackageReference Include="Glacier.Agent" Condition="!Exists('../../../Glacier.Agent/src/Glacier.Agent/Glacier.Agent.csproj') or '$(UseLocalProjectReferences)' == 'false'" />
   </ItemGroup>
 </Project>

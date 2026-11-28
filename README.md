@@ -34,7 +34,7 @@
 
 1. **PagedAttention Engine**:
    - Divides KV cache into 16-token unmanaged virtual memory pages.
-   - Eliminates memory fragmentation completely with $O(1)$ lock-free recycling (`ConcurrentStack<int>`).
+   - Eliminates memory fragmentation completely with $O(1)$ synchronized block recycling and token-verified doubly-linked LRU prefix caching.
    - Slashes memory requirements from **8.96 GB down to 346 MB** across 20 concurrent sequences.
 
 2. **Continuous Iteration Batching**:
@@ -132,7 +132,6 @@ dotnet add package Glacier.Serve --version 1.9.0
   - `.WithMaxConcurrentConnections(max)`: Admission control returning `503 Service Unavailable` with clean socket drain under overload.
   - `.WithHeaderTimeout(timeout)`: Slowloris header timeout closing stalled clients with `408 Request Timeout`.
 - **HTTP/1.1 Chunked SSE Streaming (`HttpResponse`)** — Added `WriteChunkAsync`, `CompleteChunkedAsync`, and `WriteSseEventAsync` with `FlushResult.IsCompleted`/`IsCanceled` checks and `Glacier.Serve/1.9.0` server banner.
-```
 
 ---
 
@@ -142,7 +141,7 @@ dotnet add package Glacier.Serve --version 1.9.0
   - Request quiescence and idle-period tracking with configurable sleep initiation thresholds (`IdleTimeToTriggerSleep`, `TokensProcessedThreshold`).
   - Automated offline biological consolidation: unlocks pre-allocated MoE expansion banks, filters high-quality dream trajectories via SIMD Levenshtein + Cosine metrics, executes Generalized Knowledge Distillation (GKD), and resets volatile fast memory tiers.
   - Zero-downtime serving resumption with instant thread-safe state synchronization.
-- **Ecosystem Dependency Alignment**: Upgraded `Glacier.Inference` to `v1.5.0` (HOPE Continuum Memory) and `Glacier.Tune` to `v1.1.0` (Sleep Consolidation Pipeline).
+- **Ecosystem Dependency Alignment**: Aligned with `Glacier.Inference` `v1.10.1` (HOPE Continuum Memory) and `Glacier.Tune` `v1.7.0` (Sleep Consolidation Pipeline).
 
 ---
 

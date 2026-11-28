@@ -314,9 +314,9 @@ public sealed unsafe class CudaPagedTransformerRunner : IPagedModelRunner, IHidd
                 gpuModel?.Dispose();
                 gpu?.Dispose();
             }
-            catch
+            catch (Exception cleanupEx)
             {
-                // Ignore secondary cleanup errors during fallback
+                GlacierDiagnostics.LogDebug($"[CudaPagedTransformerRunner] Secondary cleanup during fallback failed: {cleanupEx.Message}");
             }
 
             runner = null;
@@ -989,9 +989,9 @@ public sealed unsafe class CudaPagedTransformerRunner : IPagedModelRunner, IHidd
                 _dKPool = IntPtr.Zero;
             }
         }
-        catch
+        catch (Exception ex)
         {
-            // Ignore context teardown errors
+            GlacierDiagnostics.LogDebug($"[CudaPagedTransformerRunner] CUDA context teardown skipped: {ex.Message}");
         }
 
         _gpuModel.Dispose();

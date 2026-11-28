@@ -174,6 +174,7 @@ public sealed class M4aRuntimeLoraRoutingTests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public async Task CudaPagedTransformerRunner_WhenAvailable_SupportsHeterogeneousLoraAndEngineMixedBatch()
     {
         string tempDir = M4aTestHelpers.CreateTempDirectory("m4a_r2_cuda");
@@ -357,12 +358,14 @@ public sealed class M4aRuntimeLoraRoutingTests
             await foreach (var _ in stRosReloaded) { }
             await sRosReloaded.Completion.Task;
 
-            // Release held sequences cleanly
+            // Release held sequences cleanly (a sequence may have already reached EOS before cancellation)
             holdCts.Cancel();
             await enumBase1.DisposeAsync();
             await enumRos1.DisposeAsync();
-            try { await sBase1.Completion.Task; } catch (OperationCanceledException) { }
-            try { await sRos1.Completion.Task; } catch (OperationCanceledException) { }
+            try { await sBase1.Completion.Task; }
+            catch (OperationCanceledException) { Assert.True(sBase1.IsFinished); }
+            try { await sRos1.Completion.Task; }
+            catch (OperationCanceledException) { Assert.True(sRos1.IsFinished); }
 
             // 6. Enqueue in-flight request, immediately UnloadLoraAdapter -> in-flight completes, subsequent fails
             var (sInFlight, stInFlight) = await engine.EnqueueAsync(new InferenceRequest { Lora = "roslyn", Prompt = longPrompt, MaxTokens = 4, Temperature = 0f });

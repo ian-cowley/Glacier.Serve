@@ -1,7 +1,10 @@
 using System;
+using System.Buffers;
 using System.Buffers.Text;
 using System.Collections.Generic;
-using System.IO.Pipelines;
+using System.Globalization;
+using System.IO;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -16,6 +19,8 @@ namespace Glacier.Serve.Inference.Http;
 
 public static class OpenAiEndpoints
 {
+    private static readonly ReadOnlyMemory<byte> s_sseDoneBytes = "data: [DONE]\n\n"u8.ToArray();
+
     public static void MapOpenAiEndpoints(this GlacierServeApp app, ContinuousBatchEngine engine, string defaultModelName = "glacier-enterprise-7b")
     {
         // POST /v1/chat/completions
@@ -29,7 +34,6 @@ public static class OpenAiEndpoints
             }
 
             using var requestCts = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted);
-            using var disconnectTimer = StartDisconnectMonitor(ctx, requestCts);
 
             try
             {
@@ -37,6 +41,11 @@ public static class OpenAiEndpoints
                 try
                 {
                     enqueued = await engine.EnqueueAsync(req, defaultModelName, requestCts.Token);
+                }
+                catch (InferenceOverloadedException ex)
+                {
+                    await WriteOverloadedAsync(ctx.Response, ex);
+                    return;
                 }
                 catch (ArgumentOutOfRangeException ex)
                 {
@@ -63,45 +72,70 @@ public static class OpenAiEndpoints
                 {
                     ctx.Response.ContentType = "text/event-stream";
                     ctx.Response.Headers["Cache-Control"] = "no-cache";
-                    ctx.Response.Headers["Connection"] = "close";
+                    ctx.Response.UseChunkedTransfer = true;
                     await ctx.Response.EnsureHeadersSentAsync(null, requestCts.Token);
 
                     long nowSec = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-
-                    await foreach (var token in tokenStream.WithCancellation(requestCts.Token))
+                    var sseBuf = HttpResponse.RentJsonBuffer();
+                    try
                     {
-                        if (ctx.IsClientDisconnected)
+                        await foreach (var token in tokenStream.WithCancellation(requestCts.Token))
+                        {
+                            if (ctx.IsClientDisconnected)
+                            {
+                                requestCts.Cancel();
+                                return;
+                            }
+
+                            sseBuf.Clear();
+                            WriteChatSseChunk(sseBuf, state.RequestId, nowSec, modelName, token);
+                            if (!await ctx.Response.WriteChunkAsync(sseBuf.WrittenMemory, requestCts.Token))
+                            {
+                                requestCts.Cancel();
+                                return;
+                            }
+                        }
+
+                        string finishReason = SanitizeFinishReason(state.FinishReason);
+                        sseBuf.Clear();
+                        WriteChatSseFinishChunk(sseBuf, state.RequestId, nowSec, modelName, finishReason);
+                        if (!await ctx.Response.WriteChunkAsync(sseBuf.WrittenMemory, requestCts.Token))
                         {
                             requestCts.Cancel();
                             return;
                         }
 
-                        WriteChatSseChunk(ctx.Response.BodyWriter, state.RequestId, nowSec, modelName, token);
-                        var flushRes = await ctx.Response.BodyWriter.FlushAsync(requestCts.Token);
-                        if (flushRes.IsCanceled || flushRes.IsCompleted)
+                        if (req.StreamOptions?.IncludeUsage == true)
+                        {
+                            int promptTokens = state.PromptTokens.Length;
+                            int completionTokens = state.GeneratedTokens.Count;
+                            sseBuf.Clear();
+                            WriteChatSseUsageChunk(
+                                sseBuf,
+                                state.RequestId,
+                                nowSec,
+                                modelName,
+                                promptTokens,
+                                completionTokens,
+                                promptTokens + completionTokens);
+                            if (!await ctx.Response.WriteChunkAsync(sseBuf.WrittenMemory, requestCts.Token))
+                            {
+                                requestCts.Cancel();
+                                return;
+                            }
+                        }
+
+                        if (!await ctx.Response.WriteChunkAsync(s_sseDoneBytes, requestCts.Token))
                         {
                             requestCts.Cancel();
                             return;
                         }
+                        await ctx.Response.CompleteChunkedAsync(requestCts.Token);
                     }
-
-                    string finishReason = string.IsNullOrEmpty(state.FinishReason) ? "stop" : state.FinishReason;
-                    WriteChatSseFinishChunk(ctx.Response.BodyWriter, state.RequestId, nowSec, modelName, finishReason);
-                    if (req.StreamOptions?.IncludeUsage == true)
+                    finally
                     {
-                        int promptTokens = state.PromptTokens.Length;
-                        int completionTokens = state.GeneratedTokens.Count;
-                        WriteChatSseUsageChunk(
-                            ctx.Response.BodyWriter,
-                            state.RequestId,
-                            nowSec,
-                            modelName,
-                            promptTokens,
-                            completionTokens,
-                            promptTokens + completionTokens);
+                        HttpResponse.ReturnJsonBuffer(sseBuf);
                     }
-                    WriteSseDone(ctx.Response.BodyWriter);
-                    await ctx.Response.BodyWriter.FlushAsync(requestCts.Token);
                 }
                 else
                 {
@@ -118,7 +152,7 @@ public static class OpenAiEndpoints
                             {
                                 Index = 0,
                                 Message = new ChatMessage { Role = "assistant", Content = fullResponse },
-                                FinishReason = string.IsNullOrEmpty(state.FinishReason) ? "stop" : state.FinishReason
+                                FinishReason = SanitizeFinishReason(state.FinishReason)
                             }
                         ],
                         Usage = new ChatUsage
@@ -132,7 +166,7 @@ public static class OpenAiEndpoints
                     await ctx.Response.WriteJsonAsync(res, ServeJsonContext.Default.ChatCompletionResponse, requestCts.Token);
                 }
             }
-            catch (OperationCanceledException)
+            catch (Exception ex) when (ex is OperationCanceledException or IOException or SocketException)
             {
                 requestCts.Cancel();
             }
@@ -153,7 +187,6 @@ public static class OpenAiEndpoints
             }
 
             using var requestCts = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted);
-            using var disconnectTimer = StartDisconnectMonitor(ctx, requestCts);
 
             try
             {
@@ -161,6 +194,11 @@ public static class OpenAiEndpoints
                 try
                 {
                     enqueued = await engine.EnqueueAsync(req, defaultModelName, requestCts.Token);
+                }
+                catch (InferenceOverloadedException ex)
+                {
+                    await WriteOverloadedAsync(ctx.Response, ex);
+                    return;
                 }
                 catch (ArgumentOutOfRangeException ex)
                 {
@@ -187,45 +225,70 @@ public static class OpenAiEndpoints
                 {
                     ctx.Response.ContentType = "text/event-stream";
                     ctx.Response.Headers["Cache-Control"] = "no-cache";
-                    ctx.Response.Headers["Connection"] = "close";
+                    ctx.Response.UseChunkedTransfer = true;
                     await ctx.Response.EnsureHeadersSentAsync(null, requestCts.Token);
 
                     long nowSec = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-
-                    await foreach (var token in tokenStream.WithCancellation(requestCts.Token))
+                    var sseBuf = HttpResponse.RentJsonBuffer();
+                    try
                     {
-                        if (ctx.IsClientDisconnected)
+                        await foreach (var token in tokenStream.WithCancellation(requestCts.Token))
+                        {
+                            if (ctx.IsClientDisconnected)
+                            {
+                                requestCts.Cancel();
+                                return;
+                            }
+
+                            sseBuf.Clear();
+                            WriteTextCompletionSseChunk(sseBuf, state.RequestId, nowSec, modelName, token);
+                            if (!await ctx.Response.WriteChunkAsync(sseBuf.WrittenMemory, requestCts.Token))
+                            {
+                                requestCts.Cancel();
+                                return;
+                            }
+                        }
+
+                        string finishReason = SanitizeFinishReason(state.FinishReason);
+                        sseBuf.Clear();
+                        WriteTextCompletionSseFinishChunk(sseBuf, state.RequestId, nowSec, modelName, finishReason);
+                        if (!await ctx.Response.WriteChunkAsync(sseBuf.WrittenMemory, requestCts.Token))
                         {
                             requestCts.Cancel();
                             return;
                         }
 
-                        WriteTextCompletionSseChunk(ctx.Response.BodyWriter, state.RequestId, nowSec, modelName, token);
-                        var flushRes = await ctx.Response.BodyWriter.FlushAsync(requestCts.Token);
-                        if (flushRes.IsCanceled || flushRes.IsCompleted)
+                        if (req.StreamOptions?.IncludeUsage == true)
+                        {
+                            int promptTokens = state.PromptTokens.Length;
+                            int completionTokens = state.GeneratedTokens.Count;
+                            sseBuf.Clear();
+                            WriteTextCompletionSseUsageChunk(
+                                sseBuf,
+                                state.RequestId,
+                                nowSec,
+                                modelName,
+                                promptTokens,
+                                completionTokens,
+                                promptTokens + completionTokens);
+                            if (!await ctx.Response.WriteChunkAsync(sseBuf.WrittenMemory, requestCts.Token))
+                            {
+                                requestCts.Cancel();
+                                return;
+                            }
+                        }
+
+                        if (!await ctx.Response.WriteChunkAsync(s_sseDoneBytes, requestCts.Token))
                         {
                             requestCts.Cancel();
                             return;
                         }
+                        await ctx.Response.CompleteChunkedAsync(requestCts.Token);
                     }
-
-                    string finishReason = string.IsNullOrEmpty(state.FinishReason) ? "stop" : state.FinishReason;
-                    WriteTextCompletionSseFinishChunk(ctx.Response.BodyWriter, state.RequestId, nowSec, modelName, finishReason);
-                    if (req.StreamOptions?.IncludeUsage == true)
+                    finally
                     {
-                        int promptTokens = state.PromptTokens.Length;
-                        int completionTokens = state.GeneratedTokens.Count;
-                        WriteTextCompletionSseUsageChunk(
-                            ctx.Response.BodyWriter,
-                            state.RequestId,
-                            nowSec,
-                            modelName,
-                            promptTokens,
-                            completionTokens,
-                            promptTokens + completionTokens);
+                        HttpResponse.ReturnJsonBuffer(sseBuf);
                     }
-                    WriteSseDone(ctx.Response.BodyWriter);
-                    await ctx.Response.BodyWriter.FlushAsync(requestCts.Token);
                 }
                 else
                 {
@@ -242,7 +305,7 @@ public static class OpenAiEndpoints
                             {
                                 Text = fullResponse,
                                 Index = 0,
-                                FinishReason = string.IsNullOrEmpty(state.FinishReason) ? "stop" : state.FinishReason
+                                FinishReason = SanitizeFinishReason(state.FinishReason)
                             }
                         ],
                         Usage = new ChatUsage
@@ -256,7 +319,7 @@ public static class OpenAiEndpoints
                     await ctx.Response.WriteJsonAsync(res, ServeJsonContext.Default.CompletionResponse, requestCts.Token);
                 }
             }
-            catch (OperationCanceledException)
+            catch (Exception ex) when (ex is OperationCanceledException or IOException or SocketException)
             {
                 requestCts.Cancel();
             }
@@ -300,16 +363,30 @@ public static class OpenAiEndpoints
         });
     }
 
-    internal static Timer? StartDisconnectMonitor(HttpContext ctx, CancellationTokenSource requestCts)
+    internal static string SanitizeFinishReason(string? finishReason)
     {
-        if (ctx.ClientDisconnectProbe == null) return null;
-        return new Timer(_ =>
+        if (string.IsNullOrEmpty(finishReason))
+            return "stop";
+        if (string.Equals(finishReason, "pool_oom", StringComparison.OrdinalIgnoreCase))
+            return "length";
+        if (string.Equals(finishReason, "cancelled", StringComparison.OrdinalIgnoreCase))
+            return "stop";
+        return finishReason;
+    }
+
+    internal static ValueTask WriteOverloadedAsync(HttpResponse response, InferenceOverloadedException ex)
+    {
+        response.StatusCode = ex.StatusCode;
+        response.Headers["Retry-After"] = ex.RetryAfterSeconds.ToString(CultureInfo.InvariantCulture);
+        var err = new ApiErrorResponse
         {
-            if (!requestCts.IsCancellationRequested && ctx.IsClientDisconnected)
+            Error = new ApiErrorDetail
             {
-                try { requestCts.Cancel(); } catch { }
+                Message = ex.Message,
+                Type = ex.StatusCode == 429 ? "rate_limit_exceeded" : "server_overloaded"
             }
-        }, null, dueTime: 10, period: 10);
+        };
+        return response.WriteJsonAsync(err, ServeJsonContext.Default.ApiErrorResponse);
     }
 
     private static ValueTask WriteBadRequestAsync(HttpResponse response, string message)
@@ -425,11 +502,10 @@ public static class OpenAiEndpoints
     private static ReadOnlySpan<byte> SseUsageCompletionPrefix => ",\"completion_tokens\":"u8;
     private static ReadOnlySpan<byte> SseUsageTotalPrefix => ",\"total_tokens\":"u8;
     private static ReadOnlySpan<byte> SseUsageSuffix => "}}\n\n"u8;
-    private static ReadOnlySpan<byte> SseDone => "data: [DONE]\n\n"u8;
 
     private static int GetMaxJsonEscapedByteCount(string s) => checked(s.Length * 6 + 4);
 
-    private static void WriteChatSseChunk(PipeWriter writer, string requestId, long nowSec, string modelName, string token)
+    private static void WriteChatSseChunk(IBufferWriter<byte> writer, string requestId, long nowSec, string modelName, string token)
     {
         int maxBytes = GetMaxJsonEscapedByteCount(token) + GetMaxJsonEscapedByteCount(modelName) + Encoding.UTF8.GetMaxByteCount(requestId.Length) + 512;
         var span = writer.GetSpan(maxBytes);
@@ -448,7 +524,7 @@ public static class OpenAiEndpoints
         writer.Advance(written);
     }
 
-    private static void WriteChatSseFinishChunk(PipeWriter writer, string requestId, long nowSec, string modelName, string finishReason)
+    private static void WriteChatSseFinishChunk(IBufferWriter<byte> writer, string requestId, long nowSec, string modelName, string finishReason)
     {
         int maxBytes = GetMaxJsonEscapedByteCount(modelName) + GetMaxJsonEscapedByteCount(finishReason) + Encoding.UTF8.GetMaxByteCount(requestId.Length) + 512;
         var span = writer.GetSpan(maxBytes);
@@ -467,7 +543,7 @@ public static class OpenAiEndpoints
         writer.Advance(written);
     }
 
-    private static void WriteTextCompletionSseChunk(PipeWriter writer, string requestId, long nowSec, string modelName, string token)
+    private static void WriteTextCompletionSseChunk(IBufferWriter<byte> writer, string requestId, long nowSec, string modelName, string token)
     {
         int maxBytes = GetMaxJsonEscapedByteCount(token) + GetMaxJsonEscapedByteCount(modelName) + Encoding.UTF8.GetMaxByteCount(requestId.Length) + 512;
         var span = writer.GetSpan(maxBytes);
@@ -486,7 +562,7 @@ public static class OpenAiEndpoints
         writer.Advance(written);
     }
 
-    private static void WriteTextCompletionSseFinishChunk(PipeWriter writer, string requestId, long nowSec, string modelName, string finishReason)
+    private static void WriteTextCompletionSseFinishChunk(IBufferWriter<byte> writer, string requestId, long nowSec, string modelName, string finishReason)
     {
         int maxBytes = GetMaxJsonEscapedByteCount(modelName) + GetMaxJsonEscapedByteCount(finishReason) + Encoding.UTF8.GetMaxByteCount(requestId.Length) + 512;
         var span = writer.GetSpan(maxBytes);
@@ -506,7 +582,7 @@ public static class OpenAiEndpoints
     }
 
     private static void WriteChatSseUsageChunk(
-        PipeWriter writer,
+        IBufferWriter<byte> writer,
         string requestId,
         long nowSec,
         string modelName,
@@ -518,7 +594,7 @@ public static class OpenAiEndpoints
     }
 
     private static void WriteTextCompletionSseUsageChunk(
-        PipeWriter writer,
+        IBufferWriter<byte> writer,
         string requestId,
         long nowSec,
         string modelName,
@@ -530,7 +606,7 @@ public static class OpenAiEndpoints
     }
 
     private static void WriteSseUsageChunk(
-        PipeWriter writer,
+        IBufferWriter<byte> writer,
         ReadOnlySpan<byte> objectSpan,
         string requestId,
         long nowSec,
@@ -558,12 +634,5 @@ public static class OpenAiEndpoints
         SseUsageSuffix.CopyTo(span[written..]); written += SseUsageSuffix.Length;
 
         writer.Advance(written);
-    }
-
-    private static void WriteSseDone(PipeWriter writer)
-    {
-        var doneSpan = writer.GetSpan(SseDone.Length);
-        SseDone.CopyTo(doneSpan);
-        writer.Advance(SseDone.Length);
     }
 }

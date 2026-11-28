@@ -10,6 +10,7 @@ using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json.Serialization;
+using System.Threading;
 using System.Threading.Tasks;
 using Glacier.Serve.Server;
 using Xunit;
@@ -122,26 +123,84 @@ public class ServerIntegrationTests
         using var app = GlacierServeApp.CreateBuilder()
             .UsePort(port)
             .WithMaxConcurrentConnections(1)
-            .WithHeaderTimeout(TimeSpan.FromMilliseconds(200))
+            .WithHeaderTimeout(TimeSpan.FromMilliseconds(500))
             .MapGet("/ok", async ctx => await ctx.Response.WriteUtf8Async("ok"))
             .Build();
 
         await app.StartAsync();
 
-        using var slowClient = new TcpClient();
-        await slowClient.ConnectAsync(IPAddress.Loopback, port);
-        await slowClient.GetStream().WriteAsync("GET /ok HTTP/1.1\r\n"u8.ToArray());
-
-        // Second connection while first holds the single connection slot should get 503 immediately
         using var handler = new HttpClientHandler { UseProxy = false };
         using var http = new HttpClient(handler) { BaseAddress = new Uri($"http://127.0.0.1:{port}") };
+
+        using var slowClient = new TcpClient { NoDelay = true };
+        await slowClient.ConnectAsync(IPAddress.Loopback, port);
+        NetworkStream slowStream = slowClient.GetStream();
+        await slowStream.WriteAsync("GET /ok HTTP/1.1\r\n"u8.ToArray());
+        await slowStream.FlushAsync();
+
+        // Second connection while first holds the single connection slot should get 503 immediately
         var busyRes = await http.GetAsync("/ok");
         Assert.Equal(HttpStatusCode.ServiceUnavailable, busyRes.StatusCode);
 
-        // Wait past header timeout so Slowloris slot is released
-        await Task.Delay(350);
+        // Wait deterministically for the server to time out the Slowloris header with 408 and close the connection
+        using var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        byte[] buf = new byte[512];
+        var sb = new StringBuilder();
+        while (true)
+        {
+            int n = await slowStream.ReadAsync(buf, readCts.Token);
+            if (n == 0)
+                break;
+            sb.Append(Encoding.ASCII.GetString(buf, 0, n));
+        }
+        Assert.Contains("408 Request Timeout", sb.ToString(), StringComparison.Ordinal);
+
+        // Allow ProcessConnectionAsync finally block to release the connection semaphore right after stream teardown
+        await Task.Delay(50);
+
         var recoveredRes = await http.GetAsync("/ok");
         Assert.Equal(HttpStatusCode.OK, recoveredRes.StatusCode);
+    }
+
+    [Fact]
+    public async Task Server_OverloadedConnection_DelayedClientRequest_Receives503WithoutReset()
+    {
+        int port = GetAvailablePort();
+        using var app = GlacierServeApp.CreateBuilder()
+            .UsePort(port)
+            .WithMaxConcurrentConnections(1)
+            .WithHeaderTimeout(TimeSpan.FromSeconds(2))
+            .MapGet("/ok", async ctx => await ctx.Response.WriteUtf8Async("ok"))
+            .Build();
+
+        await app.StartAsync();
+
+        using var holder = new TcpClient { NoDelay = true };
+        await holder.ConnectAsync(IPAddress.Loopback, port);
+        await holder.GetStream().WriteAsync("GET /ok HTTP/1.1\r\n"u8.ToArray());
+        await holder.GetStream().FlushAsync();
+
+        // Connect second raw client and wait 40ms (> old 10ms Poll) before writing request bytes
+        using var overloaded = new TcpClient { NoDelay = true };
+        await overloaded.ConnectAsync(IPAddress.Loopback, port);
+        await Task.Delay(40);
+
+        NetworkStream stream = overloaded.GetStream();
+        await stream.WriteAsync("GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"u8.ToArray());
+        await stream.FlushAsync();
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        byte[] buf = new byte[512];
+        var sb = new StringBuilder();
+        while (true)
+        {
+            int n = await stream.ReadAsync(buf, cts.Token);
+            if (n == 0)
+                break;
+            sb.Append(Encoding.ASCII.GetString(buf, 0, n));
+        }
+
+        Assert.Contains("503 Service Unavailable", sb.ToString(), StringComparison.Ordinal);
     }
 
     [Fact]

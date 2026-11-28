@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Net.Sockets;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -29,7 +31,6 @@ public static class OllamaEndpoints
             bool stream = req.IsStreamExplicitlySet ? req.Stream : true;
 
             using var requestCts = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted);
-            using var disconnectTimer = OpenAiEndpoints.StartDisconnectMonitor(ctx, requestCts);
 
             try
             {
@@ -37,6 +38,11 @@ public static class OllamaEndpoints
                 try
                 {
                     enqueued = await engine.EnqueueAsync(req, defaultModelName, requestCts.Token);
+                }
+                catch (InferenceOverloadedException ex)
+                {
+                    await OpenAiEndpoints.WriteOverloadedAsync(ctx.Response, ex);
+                    return;
                 }
                 catch (ArgumentOutOfRangeException ex)
                 {
@@ -67,7 +73,7 @@ public static class OllamaEndpoints
                         Model = modelName,
                         Message = new ChatMessage { Role = "assistant", Content = fullText },
                         Done = true,
-                        DoneReason = string.IsNullOrEmpty(state.FinishReason) ? "stop" : state.FinishReason,
+                        DoneReason = OpenAiEndpoints.SanitizeFinishReason(state.FinishReason),
                         PromptEvalCount = state.PromptTokens.Length,
                         EvalCount = state.GeneratedTokens.Count
                     };
@@ -76,7 +82,7 @@ public static class OllamaEndpoints
                 }
 
                 ctx.Response.ContentType = "application/x-ndjson; charset=utf-8";
-                ctx.Response.Headers["Connection"] = "close";
+                ctx.Response.UseChunkedTransfer = true;
                 await ctx.Response.EnsureHeadersSentAsync(null, requestCts.Token);
 
                 await foreach (var token in tokenStream.WithCancellation(requestCts.Token))
@@ -102,14 +108,15 @@ public static class OllamaEndpoints
                     Model = modelName,
                     Message = new ChatMessage { Role = "assistant", Content = string.Empty },
                     Done = true,
-                    DoneReason = string.IsNullOrEmpty(state.FinishReason) ? "stop" : state.FinishReason,
+                    DoneReason = OpenAiEndpoints.SanitizeFinishReason(state.FinishReason),
                     PromptEvalCount = state.PromptTokens.Length,
                     EvalCount = state.GeneratedTokens.Count
                 };
 
                 await ctx.Response.WriteNdjsonLineAsync(finalChunkDto, ServeJsonContext.Default.OllamaChatChunk, requestCts.Token);
+                await ctx.Response.CompleteChunkedAsync(requestCts.Token);
             }
-            catch (OperationCanceledException)
+            catch (Exception ex) when (ex is OperationCanceledException or IOException or SocketException)
             {
                 requestCts.Cancel();
             }
@@ -132,7 +139,6 @@ public static class OllamaEndpoints
             bool stream = req.IsStreamExplicitlySet ? req.Stream : true;
 
             using var requestCts = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted);
-            using var disconnectTimer = OpenAiEndpoints.StartDisconnectMonitor(ctx, requestCts);
 
             try
             {
@@ -140,6 +146,11 @@ public static class OllamaEndpoints
                 try
                 {
                     enqueued = await engine.EnqueueAsync(req, defaultModelName, requestCts.Token);
+                }
+                catch (InferenceOverloadedException ex)
+                {
+                    await OpenAiEndpoints.WriteOverloadedAsync(ctx.Response, ex);
+                    return;
                 }
                 catch (ArgumentOutOfRangeException ex)
                 {
@@ -170,7 +181,7 @@ public static class OllamaEndpoints
                         Model = modelName,
                         Response = fullText,
                         Done = true,
-                        DoneReason = string.IsNullOrEmpty(state.FinishReason) ? "stop" : state.FinishReason,
+                        DoneReason = OpenAiEndpoints.SanitizeFinishReason(state.FinishReason),
                         PromptEvalCount = state.PromptTokens.Length,
                         EvalCount = state.GeneratedTokens.Count
                     };
@@ -179,7 +190,7 @@ public static class OllamaEndpoints
                 }
 
                 ctx.Response.ContentType = "application/x-ndjson; charset=utf-8";
-                ctx.Response.Headers["Connection"] = "close";
+                ctx.Response.UseChunkedTransfer = true;
                 await ctx.Response.EnsureHeadersSentAsync(null, requestCts.Token);
 
                 await foreach (var token in tokenStream.WithCancellation(requestCts.Token))
@@ -205,14 +216,15 @@ public static class OllamaEndpoints
                     Model = modelName,
                     Response = string.Empty,
                     Done = true,
-                    DoneReason = string.IsNullOrEmpty(state.FinishReason) ? "stop" : state.FinishReason,
+                    DoneReason = OpenAiEndpoints.SanitizeFinishReason(state.FinishReason),
                     PromptEvalCount = state.PromptTokens.Length,
                     EvalCount = state.GeneratedTokens.Count
                 };
 
                 await ctx.Response.WriteNdjsonLineAsync(finalChunkDto, ServeJsonContext.Default.OllamaGenerateChunk, requestCts.Token);
+                await ctx.Response.CompleteChunkedAsync(requestCts.Token);
             }
-            catch (OperationCanceledException)
+            catch (Exception ex) when (ex is OperationCanceledException or IOException or SocketException)
             {
                 requestCts.Cancel();
             }

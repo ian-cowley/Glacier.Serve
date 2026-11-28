@@ -26,6 +26,8 @@ public sealed record PeerBounceEndpointOptions(
 /// </summary>
 public static class PeerBounceEndpoints
 {
+    private static readonly ReadOnlyMemory<byte> s_sseDoneBytes = "data: [DONE]\n\n"u8.ToArray();
+
     public static void MapPeerBounce(
         this GlacierServeApp app,
         PeerBounceService bounceService,
@@ -181,7 +183,7 @@ public static class PeerBounceEndpoints
         {
             ctx.Response.ContentType = "text/event-stream";
             ctx.Response.Headers["Cache-Control"] = "no-cache";
-            ctx.Response.Headers["Connection"] = "close";
+            ctx.Response.UseChunkedTransfer = true;
             await ctx.Response.EnsureHeadersSentAsync(null, ctx.RequestAborted).ConfigureAwait(false);
 
             var chunk = new ChatCompletionChunkResponse
@@ -200,11 +202,30 @@ public static class PeerBounceEndpoints
                 ]
             };
 
-            string chunkJson = JsonSerializer.Serialize(chunk, ServeJsonContext.Default.ChatCompletionChunkResponse);
-            await ctx.Response.BodyWriter.WriteAsync(
-                System.Text.Encoding.UTF8.GetBytes($"data: {chunkJson}\n\ndata: [DONE]\n\n"),
-                ctx.RequestAborted).ConfigureAwait(false);
-            await ctx.Response.BodyWriter.FlushAsync(ctx.RequestAborted).ConfigureAwait(false);
+            var sseBuf = HttpResponse.RentJsonBuffer();
+            try
+            {
+                Span<byte> prefix = sseBuf.GetSpan(6);
+                "data: "u8.CopyTo(prefix);
+                sseBuf.Advance(6);
+
+                using (var jsonWriter = new Utf8JsonWriter(sseBuf))
+                {
+                    JsonSerializer.Serialize(jsonWriter, chunk, ServeJsonContext.Default.ChatCompletionChunkResponse);
+                }
+
+                Span<byte> suffix = sseBuf.GetSpan(2);
+                "\n\n"u8.CopyTo(suffix);
+                sseBuf.Advance(2);
+
+                await ctx.Response.WriteSseEventAsync(sseBuf.WrittenMemory, ctx.RequestAborted).ConfigureAwait(false);
+                await ctx.Response.WriteSseEventAsync(s_sseDoneBytes, ctx.RequestAborted).ConfigureAwait(false);
+                await ctx.Response.CompleteChunkedAsync(ctx.RequestAborted).ConfigureAwait(false);
+            }
+            finally
+            {
+                HttpResponse.ReturnJsonBuffer(sseBuf);
+            }
             return;
         }
 

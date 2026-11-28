@@ -58,7 +58,7 @@ public sealed class GlacierServeBuilder
             foreach (string p in exemptPaths)
             {
                 if (!string.IsNullOrEmpty(p))
-                    _authExemptPaths.Add(p);
+                    _authExemptPaths.Add(GlacierServeApp.NormalizePath(p));
             }
         }
         return this;

@@ -4,6 +4,8 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Threading;
+using Glacier.Serve.Diagnostics;
 
 /// <summary>
 /// True compressed UTF-8 prefix &amp; parametric segment Radix Tree router.
@@ -11,6 +13,7 @@ using System.Text;
 /// with zero intermediate string or segment-array heap allocations on static routes,
 /// stripping query strings (<c>?...</c>) in place and decoding UTF-8 parameter slices only on match.
 /// Supports both <c>{param}</c> and <c>:param</c> route parameter syntax.
+/// Thread-safe for concurrent <see cref="AddRoute"/> and lock-free <see cref="TryMatch"/> via copy-on-write snapshots.
 /// </summary>
 public sealed class RadixTreeRouter : IRouter
 {
@@ -32,6 +35,26 @@ public sealed class RadixTreeRouter : IRouter
         public RadixNode(byte[] prefix)
         {
             Prefix = prefix;
+        }
+
+        public RadixNode CloneDeep()
+        {
+            var copy = new RadixNode(Prefix);
+            Array.Copy(Handlers, copy.Handlers, MethodCount);
+            if (ParametricChild != null)
+            {
+                copy.ParametricChild = ParametricChild.CloneDeep();
+            }
+            if (StaticChildren.Length > 0)
+            {
+                var children = new RadixNode[StaticChildren.Length];
+                for (int i = 0; i < StaticChildren.Length; i++)
+                {
+                    children[i] = StaticChildren[i].CloneDeep();
+                }
+                copy.StaticChildren = children;
+            }
+            return copy;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -65,8 +88,20 @@ public sealed class RadixTreeRouter : IRouter
         }
     }
 
-    private readonly RadixNode _root = new([]);
-    private int _maxParams;
+    private sealed class RouterState
+    {
+        public readonly RadixNode Root;
+        public readonly int MaxParams;
+
+        public RouterState(RadixNode root, int maxParams)
+        {
+            Root = root;
+            MaxParams = maxParams;
+        }
+    }
+
+    private readonly Lock _writeLock = new();
+    private RouterState _state = new(new RadixNode([]), 0);
 
     public void AddRoute(HttpMethod method, string routeTemplate, RequestDelegate handler)
     {
@@ -86,74 +121,80 @@ public sealed class RadixTreeRouter : IRouter
         while (routeTemplate.Length > 1 && routeTemplate.EndsWith('/'))
             routeTemplate = routeTemplate[..^1];
 
-        var paramNames = new List<string>(4);
-        RadixNode current = _root;
-
-        int cursor = 0;
-        int staticStart = 0;
-
-        while (cursor < routeTemplate.Length)
-        {
-            // Detect parameter start right after '/' as either '{name}' or ':name'
-            if (cursor > 0 && routeTemplate[cursor - 1] == '/' &&
-                (routeTemplate[cursor] == '{' || routeTemplate[cursor] == ':'))
-            {
-                // Flush preceding static bytes (including the '/' right before the parameter)
-                if (cursor > staticStart)
-                {
-                    byte[] staticBytes = Encoding.UTF8.GetBytes(routeTemplate.AsSpan(staticStart, cursor - staticStart).ToString());
-                    current = InsertStaticPrefix(current, staticBytes);
-                }
-
-                string paramName;
-                if (routeTemplate[cursor] == '{')
-                {
-                    int closeBrace = routeTemplate.IndexOf('}', cursor + 1);
-                    if (closeBrace < 0)
-                        throw new ArgumentException($"Unclosed route parameter brace in template '{routeTemplate}'.", nameof(routeTemplate));
-
-                    paramName = routeTemplate[(cursor + 1)..closeBrace];
-                    cursor = closeBrace + 1;
-                }
-                else
-                {
-                    int nextSlash = routeTemplate.IndexOf('/', cursor + 1);
-                    int end = nextSlash >= 0 ? nextSlash : routeTemplate.Length;
-                    paramName = routeTemplate[(cursor + 1)..end];
-                    cursor = end;
-                }
-
-                if (string.IsNullOrEmpty(paramName))
-                    throw new ArgumentException($"Empty route parameter name in template '{routeTemplate}'.", nameof(routeTemplate));
-
-                paramNames.Add(paramName);
-                current.ParametricChild ??= new RadixNode([]);
-                current = current.ParametricChild;
-                staticStart = cursor;
-                continue;
-            }
-
-            cursor++;
-        }
-
-        if (cursor > staticStart)
-        {
-            byte[] trailingStatic = Encoding.UTF8.GetBytes(routeTemplate[staticStart..cursor]);
-            current = InsertStaticPrefix(current, trailingStatic);
-        }
-
-        if (paramNames.Count > _maxParams)
-            _maxParams = paramNames.Count;
-
         int methodIdx = (int)method;
         if ((uint)methodIdx >= MethodCount)
             throw new ArgumentOutOfRangeException(nameof(method));
 
-        current.Handlers[methodIdx] = new HandlerEntry
+        lock (_writeLock)
         {
-            Handler = handler,
-            ParamNames = paramNames.Count == 0 ? [] : paramNames.ToArray()
-        };
+            RouterState prev = _state;
+            RadixNode newRoot = prev.Root.CloneDeep();
+            var paramNames = new List<string>(4);
+            RadixNode current = newRoot;
+
+            int cursor = 0;
+            int staticStart = 0;
+
+            while (cursor < routeTemplate.Length)
+            {
+                // Detect parameter start right after '/' as either '{name}' or ':name'
+                if (cursor > 0 && routeTemplate[cursor - 1] == '/' &&
+                    (routeTemplate[cursor] == '{' || routeTemplate[cursor] == ':'))
+                {
+                    // Flush preceding static bytes (including the '/' right before the parameter)
+                    if (cursor > staticStart)
+                    {
+                        byte[] staticBytes = Encoding.UTF8.GetBytes(routeTemplate.AsSpan(staticStart, cursor - staticStart).ToString());
+                        current = InsertStaticPrefix(current, staticBytes);
+                    }
+
+                    string paramName;
+                    if (routeTemplate[cursor] == '{')
+                    {
+                        int closeBrace = routeTemplate.IndexOf('}', cursor + 1);
+                        if (closeBrace < 0)
+                            throw new ArgumentException($"Unclosed route parameter brace in template '{routeTemplate}'.", nameof(routeTemplate));
+
+                        paramName = routeTemplate[(cursor + 1)..closeBrace];
+                        cursor = closeBrace + 1;
+                    }
+                    else
+                    {
+                        int nextSlash = routeTemplate.IndexOf('/', cursor + 1);
+                        int end = nextSlash >= 0 ? nextSlash : routeTemplate.Length;
+                        paramName = routeTemplate[(cursor + 1)..end];
+                        cursor = end;
+                    }
+
+                    if (string.IsNullOrEmpty(paramName))
+                        throw new ArgumentException($"Empty route parameter name in template '{routeTemplate}'.", nameof(routeTemplate));
+
+                    paramNames.Add(paramName);
+                    current.ParametricChild ??= new RadixNode([]);
+                    current = current.ParametricChild;
+                    staticStart = cursor;
+                    continue;
+                }
+
+                cursor++;
+            }
+
+            if (cursor > staticStart)
+            {
+                byte[] trailingStatic = Encoding.UTF8.GetBytes(routeTemplate[staticStart..cursor]);
+                current = InsertStaticPrefix(current, trailingStatic);
+            }
+
+            int newMaxParams = Math.Max(prev.MaxParams, paramNames.Count);
+
+            current.Handlers[methodIdx] = new HandlerEntry
+            {
+                Handler = handler,
+                ParamNames = paramNames.Count == 0 ? [] : paramNames.ToArray()
+            };
+
+            Volatile.Write(ref _state, new RouterState(newRoot, newMaxParams));
+        }
     }
 
     private static RadixNode InsertStaticPrefix(RadixNode parent, ReadOnlySpan<byte> prefix)
@@ -176,9 +217,7 @@ public sealed class RadixTreeRouter : IRouter
 
             if (lcp < childPrefix.Length)
             {
-                // Split existing edge at LCP.
-                // Replace child with splitNode in current BEFORE mutating child.Prefix,
-                // because AddOrReplaceStaticChild matches on Prefix[0] == childPrefix[0].
+                // Split existing edge at LCP on the private cloned snapshot before publishing.
                 var splitNode = new RadixNode(childPrefix[..lcp].ToArray());
                 current.AddOrReplaceStaticChild(splitNode);
                 child.Prefix = childPrefix[lcp..].ToArray();
@@ -219,17 +258,18 @@ public sealed class RadixTreeRouter : IRouter
             cleanPath = cleanPath[..^1];
         }
 
-        if (_maxParams == 0)
+        RouterState state = Volatile.Read(ref _state);
+        if (state.MaxParams == 0)
         {
-            return MatchStaticOnly(_root, methodIdx, cleanPath, out match);
+            return MatchStaticOnly(state.Root, methodIdx, cleanPath, out match);
         }
 
-        int capCapacity = Math.Max(8, _maxParams);
+        int capCapacity = Math.Max(8, state.MaxParams);
         Span<(int Offset, int Length)> captures = capCapacity <= 16
             ? stackalloc (int Offset, int Length)[capCapacity]
             : new (int Offset, int Length)[capCapacity];
 
-        return MatchNode(_root, methodIdx, cleanPath, 0, captures, 0, out match);
+        return MatchNode(state.Root, methodIdx, cleanPath, 0, captures, 0, out match);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -298,7 +338,14 @@ public sealed class RadixTreeRouter : IRouter
                         string val = Encoding.UTF8.GetString(rawSeg);
                         if (rawSeg.IndexOf((byte)'%') >= 0)
                         {
-                            try { val = Uri.UnescapeDataString(val); } catch { }
+                            try
+                            {
+                                val = Uri.UnescapeDataString(val);
+                            }
+                            catch (UriFormatException ex)
+                            {
+                                GlacierDiagnostics.LogDebug($"[Glacier.Serve] Invalid percent-encoding in route parameter '{entry.ParamNames[i]}': {ex.Message}");
+                            }
                         }
                         routeParams[i] = new RouteParameter(entry.ParamNames[i], val);
                     }

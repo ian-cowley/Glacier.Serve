@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -16,12 +15,16 @@ namespace Glacier.Serve.Inference.PagedAttention;
 /// Supports <see cref="KvCachePrecision.Fp32"/>, <see cref="KvCachePrecision.Fp16"/>,
 /// <see cref="KvCachePrecision.Fp8"/>, <see cref="KvCachePrecision.Q8_0"/>, and
 /// <see cref="KvCachePrecision.Q4_0"/> (<see cref="KvCachePrecision.Int4"/>) with
-/// thread-safe O(1) lock-free block allocation and idempotent recycling.
+/// thread-safe O(1) block allocation, token-verified prefix caching, and LRU eviction.
 /// </summary>
 public sealed unsafe class PagedBlockPool : IDisposable
 {
     public const int DefaultBlockSize = 16;
     public const nuint CacheLineAlignment = 64;
+
+    private const int StateFree = 0;
+    private const int StateActive = 1;
+    private const int StateCached = 2;
 
     private readonly int _totalBlocks;
     private readonly int _blockSize;
@@ -45,11 +48,20 @@ public sealed unsafe class PagedBlockPool : IDisposable
     private byte* _kBuffer;
     private byte* _vBuffer;
     private readonly bool _allocateHostBuffers;
-    private readonly ConcurrentStack<int> _freeBlocks;
-    private readonly int[] _blockAllocatedState;
+    private readonly Lock _allocLock = new();
+    private readonly int[] _freeStack;
+    private int _freeCount;
+    private readonly int[] _blockState;
     private readonly int[] _refCounts;
     private readonly ulong[] _blockPrefixHashes;
-    private readonly ConcurrentDictionary<ulong, int> _prefixHashMap;
+    private readonly int[] _blockTokenStorage;
+    private readonly int[] _blockTokenCounts;
+    private readonly Dictionary<ulong, int> _prefixHashMap;
+    private readonly int[] _lruPrev;
+    private readonly int[] _lruNext;
+    private int _lruHead = -1;
+    private int _lruTail = -1;
+    private int _lruCount;
     private int _disposed;
 
     internal Action<int, int, int>? OnBlockForked { get; set; }
@@ -64,8 +76,27 @@ public sealed unsafe class PagedBlockPool : IDisposable
     public KvCachePrecision Precision => _precision;
     public long KeySlotBytes => _slotBytesK;
     public long ValueSlotBytes => _slotBytesV;
-    public int FreeBlocksCount => _freeBlocks.Count;
-    public int AllocatedBlocksCount => _totalBlocks - _freeBlocks.Count;
+    public int FreeBlocksCount
+    {
+        get
+        {
+            lock (_allocLock)
+            {
+                return _freeCount + _lruCount;
+            }
+        }
+    }
+    public int CachedPrefixBlocksCount
+    {
+        get
+        {
+            lock (_allocLock)
+            {
+                return _lruCount;
+            }
+        }
+    }
+    public int AllocatedBlocksCount => _totalBlocks - FreeBlocksCount;
     public int CapacityTokens => _totalBlocks * _blockSize;
     public int ActiveTokens => AllocatedBlocksCount * _blockSize;
     public bool HasHostBuffers => _allocateHostBuffers;
@@ -156,15 +187,23 @@ public sealed unsafe class PagedBlockPool : IDisposable
             _vBuffer = null;
         }
 
-        _blockAllocatedState = new int[_totalBlocks];
+        _blockState = new int[_totalBlocks];
         _refCounts = new int[_totalBlocks];
         _blockPrefixHashes = new ulong[_totalBlocks];
-        _prefixHashMap = new ConcurrentDictionary<ulong, int>();
-        _freeBlocks = new ConcurrentStack<int>();
-        for (int i = _totalBlocks - 1; i >= 0; i--)
+        _blockTokenStorage = new int[checked(_totalBlocks * _blockSize)];
+        _blockTokenCounts = new int[_totalBlocks];
+        _prefixHashMap = new Dictionary<ulong, int>();
+        _freeStack = new int[_totalBlocks];
+        _lruPrev = new int[_totalBlocks];
+        _lruNext = new int[_totalBlocks];
+        Array.Fill(_lruPrev, -1);
+        Array.Fill(_lruNext, -1);
+        for (int i = 0; i < _totalBlocks; i++)
         {
-            _freeBlocks.Push(i);
+            // Push in reverse so block 0 is popped first, matching historical LIFO order
+            _freeStack[i] = _totalBlocks - 1 - i;
         }
+        _freeCount = _totalBlocks;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -380,52 +419,161 @@ public sealed unsafe class PagedBlockPool : IDisposable
         return System.IO.Hashing.XxHash3.HashToUInt64(bytes, (long)parentHash);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void LruAppendTail(int blockId)
+    {
+        int prevTail = _lruTail;
+        _lruPrev[blockId] = prevTail;
+        _lruNext[blockId] = -1;
+        if (prevTail >= 0)
+            _lruNext[prevTail] = blockId;
+        else
+            _lruHead = blockId;
+        _lruTail = blockId;
+        _lruCount++;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void LruRemove(int blockId)
+    {
+        int prev = _lruPrev[blockId];
+        int next = _lruNext[blockId];
+        if (prev >= 0)
+            _lruNext[prev] = next;
+        else
+            _lruHead = next;
+
+        if (next >= 0)
+            _lruPrev[next] = prev;
+        else
+            _lruTail = prev;
+
+        _lruPrev[blockId] = -1;
+        _lruNext[blockId] = -1;
+        _lruCount--;
+    }
+
     /// <summary>
-    /// Attempts to allocate a physical block from the free list in O(1).
+    /// Attempts to allocate a physical block in O(1), evicting the least-recently-used
+    /// unreferenced cached prefix block when unallocated free blocks are exhausted.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryAllocateBlock(out int physicalBlockId)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-        if (_freeBlocks.TryPop(out physicalBlockId))
+        lock (_allocLock)
         {
-            Interlocked.Exchange(ref _blockAllocatedState[physicalBlockId], 1);
-            Interlocked.Exchange(ref _refCounts[physicalBlockId], 1);
-            Volatile.Write(ref _blockPrefixHashes[physicalBlockId], 0UL);
-            return true;
+            if (_freeCount > 0)
+            {
+                physicalBlockId = _freeStack[--_freeCount];
+                _blockState[physicalBlockId] = StateActive;
+                Volatile.Write(ref _refCounts[physicalBlockId], 1);
+                _blockPrefixHashes[physicalBlockId] = 0UL;
+                _blockTokenCounts[physicalBlockId] = 0;
+                return true;
+            }
+
+            if (_lruHead >= 0)
+            {
+                physicalBlockId = _lruHead;
+                LruRemove(physicalBlockId);
+                ulong oldHash = _blockPrefixHashes[physicalBlockId];
+                if (oldHash != 0UL && _prefixHashMap.TryGetValue(oldHash, out int mapped) && mapped == physicalBlockId)
+                {
+                    _prefixHashMap.Remove(oldHash);
+                }
+                _blockPrefixHashes[physicalBlockId] = 0UL;
+                _blockTokenCounts[physicalBlockId] = 0;
+                _blockState[physicalBlockId] = StateActive;
+                Volatile.Write(ref _refCounts[physicalBlockId], 1);
+                return true;
+            }
         }
+
         physicalBlockId = -1;
         return false;
     }
 
     /// <summary>
-    /// Atomically searches for a cached block matching prefixHash and increments its ref-count if found.
+    /// Atomically searches for a cached block matching <paramref name="prefixHash"/>,
+    /// resurrecting it from the LRU cache if unreferenced and incrementing its ref-count.
     /// </summary>
     public bool TryFindPrefixBlock(ulong prefixHash, out int physicalBlockId)
+        => TryFindPrefixBlockCore(prefixHash, ReadOnlySpan<int>.Empty, verifyTokens: false, out physicalBlockId);
+
+    /// <summary>
+    /// Atomically searches for a cached block matching both <paramref name="prefixHash"/> and
+    /// exact <paramref name="tokens"/> sequence (rejecting 64-bit hash collisions),
+    /// resurrecting it from the LRU cache if unreferenced and incrementing its ref-count.
+    /// </summary>
+    public bool TryFindPrefixBlock(ulong prefixHash, ReadOnlySpan<int> tokens, out int physicalBlockId)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-        if (prefixHash != 0UL && _prefixHashMap.TryGetValue(prefixHash, out physicalBlockId))
+        if (tokens.IsEmpty || tokens.Length > _blockSize)
         {
-            while (true)
+            physicalBlockId = -1;
+            return false;
+        }
+        return TryFindPrefixBlockCore(prefixHash, tokens, verifyTokens: true, out physicalBlockId);
+    }
+
+    private bool TryFindPrefixBlockCore(
+        ulong prefixHash,
+        ReadOnlySpan<int> tokens,
+        bool verifyTokens,
+        out int physicalBlockId)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        if (prefixHash == 0UL)
+        {
+            physicalBlockId = -1;
+            return false;
+        }
+
+        lock (_allocLock)
+        {
+            if (!_prefixHashMap.TryGetValue(prefixHash, out int id))
             {
-                int current = Volatile.Read(ref _refCounts[physicalBlockId]);
-                if (current <= 0)
+                physicalBlockId = -1;
+                return false;
+            }
+
+            if (_blockPrefixHashes[id] != prefixHash)
+            {
+                physicalBlockId = -1;
+                return false;
+            }
+
+            if (verifyTokens)
+            {
+                int storedCount = _blockTokenCounts[id];
+                if (storedCount > 0 &&
+                    (storedCount != tokens.Length ||
+                     !_blockTokenStorage.AsSpan(id * _blockSize, storedCount).SequenceEqual(tokens)))
                 {
                     physicalBlockId = -1;
                     return false;
                 }
-                if (Interlocked.CompareExchange(ref _refCounts[physicalBlockId], current + 1, current) == current)
-                {
-                    if (Volatile.Read(ref _blockPrefixHashes[physicalBlockId]) != prefixHash)
-                    {
-                        ReleaseBlock(physicalBlockId);
-                        physicalBlockId = -1;
-                        return false;
-                    }
-                    return true;
-                }
+            }
+
+            int state = _blockState[id];
+            if (state == StateActive && _refCounts[id] > 0)
+            {
+                Volatile.Write(ref _refCounts[id], _refCounts[id] + 1);
+                physicalBlockId = id;
+                return true;
+            }
+
+            if (state == StateCached)
+            {
+                LruRemove(id);
+                _blockState[id] = StateActive;
+                Volatile.Write(ref _refCounts[id], 1);
+                physicalBlockId = id;
+                return true;
             }
         }
+
         physicalBlockId = -1;
         return false;
     }
@@ -434,6 +582,20 @@ public sealed unsafe class PagedBlockPool : IDisposable
     /// Registers a full block's cumulative prefix hash in the cache.
     /// </summary>
     public void BindPrefixBlock(ulong prefixHash, int physicalBlockId)
+        => BindPrefixBlockCore(prefixHash, physicalBlockId, ReadOnlySpan<int>.Empty, hasTokens: false);
+
+    /// <summary>
+    /// Registers a full block's cumulative prefix hash and exact token sequence in the cache.
+    /// </summary>
+    public void BindPrefixBlock(ulong prefixHash, int physicalBlockId, ReadOnlySpan<int> tokens)
+    {
+        if (tokens.IsEmpty || tokens.Length > _blockSize)
+            throw new ArgumentOutOfRangeException(nameof(tokens), $"Token count must be between 1 and BlockSize ({_blockSize}).");
+
+        BindPrefixBlockCore(prefixHash, physicalBlockId, tokens, hasTokens: true);
+    }
+
+    private void BindPrefixBlockCore(ulong prefixHash, int physicalBlockId, ReadOnlySpan<int> tokens, bool hasTokens)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         if ((uint)physicalBlockId >= (uint)_totalBlocks)
@@ -441,8 +603,55 @@ public sealed unsafe class PagedBlockPool : IDisposable
         if (prefixHash == 0UL)
             throw new ArgumentException("Prefix hash cannot be 0.", nameof(prefixHash));
 
-        Volatile.Write(ref _blockPrefixHashes[physicalBlockId], prefixHash);
-        _prefixHashMap[prefixHash] = physicalBlockId;
+        lock (_allocLock)
+        {
+            ulong prevHash = _blockPrefixHashes[physicalBlockId];
+            if (prevHash != 0UL && prevHash != prefixHash &&
+                _prefixHashMap.TryGetValue(prevHash, out int prevMapped) && prevMapped == physicalBlockId)
+            {
+                _prefixHashMap.Remove(prevHash);
+            }
+
+            _blockPrefixHashes[physicalBlockId] = prefixHash;
+            if (hasTokens)
+            {
+                tokens.CopyTo(_blockTokenStorage.AsSpan(physicalBlockId * _blockSize, tokens.Length));
+                _blockTokenCounts[physicalBlockId] = tokens.Length;
+            }
+            else
+            {
+                _blockTokenCounts[physicalBlockId] = 0;
+            }
+            _prefixHashMap[prefixHash] = physicalBlockId;
+        }
+    }
+
+    /// <summary>
+    /// Evicts all unreferenced (<c>refCount == 0</c>) prefix blocks from the LRU cache back to the free stack.
+    /// </summary>
+    public int EvictPrefixCache()
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        lock (_allocLock)
+        {
+            int evicted = 0;
+            while (_lruHead >= 0)
+            {
+                int id = _lruHead;
+                LruRemove(id);
+                ulong hash = _blockPrefixHashes[id];
+                if (hash != 0UL && _prefixHashMap.TryGetValue(hash, out int mapped) && mapped == id)
+                {
+                    _prefixHashMap.Remove(hash);
+                }
+                _blockPrefixHashes[id] = 0UL;
+                _blockTokenCounts[id] = 0;
+                _blockState[id] = StateFree;
+                _freeStack[_freeCount++] = id;
+                evicted++;
+            }
+            return evicted;
+        }
     }
 
     /// <summary>
@@ -454,11 +663,23 @@ public sealed unsafe class PagedBlockPool : IDisposable
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         if ((uint)physicalBlockId >= (uint)_totalBlocks)
             throw new ArgumentOutOfRangeException(nameof(physicalBlockId));
-        return Interlocked.Increment(ref _refCounts[physicalBlockId]);
+
+        lock (_allocLock)
+        {
+            if (_blockState[physicalBlockId] == StateCached)
+            {
+                LruRemove(physicalBlockId);
+                _blockState[physicalBlockId] = StateActive;
+            }
+            int next = _refCounts[physicalBlockId] + 1;
+            Volatile.Write(ref _refCounts[physicalBlockId], next);
+            return next;
+        }
     }
 
     /// <summary>
-    /// Decrements atomic reference count. Recycles block to free pool when ref-count reaches 0.
+    /// Decrements reference count. When ref-count reaches 0, retains bound prefix blocks in the
+    /// LRU cache (evictable under allocation pressure) or returns unpinned blocks directly to the free stack.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int ReleaseBlock(int physicalBlockId)
@@ -467,29 +688,33 @@ public sealed unsafe class PagedBlockPool : IDisposable
         if ((uint)physicalBlockId >= (uint)_totalBlocks)
             return 0;
 
-        int remaining = Interlocked.Decrement(ref _refCounts[physicalBlockId]);
-        if (remaining < 0)
+        lock (_allocLock)
         {
-            Interlocked.Exchange(ref _refCounts[physicalBlockId], 0);
-            return 0;
-        }
+            if (_blockState[physicalBlockId] != StateActive || _refCounts[physicalBlockId] <= 0)
+                return 0;
 
-        if (remaining == 0)
-        {
-            ulong hash = Volatile.Read(ref _blockPrefixHashes[physicalBlockId]);
-            if (hash != 0UL)
+            int remaining = _refCounts[physicalBlockId] - 1;
+            Volatile.Write(ref _refCounts[physicalBlockId], remaining);
+
+            if (remaining == 0)
             {
-                _prefixHashMap.TryRemove(new KeyValuePair<ulong, int>(hash, physicalBlockId));
-                Volatile.Write(ref _blockPrefixHashes[physicalBlockId], 0UL);
+                ulong hash = _blockPrefixHashes[physicalBlockId];
+                if (hash != 0UL && _prefixHashMap.TryGetValue(hash, out int mappedId) && mappedId == physicalBlockId)
+                {
+                    _blockState[physicalBlockId] = StateCached;
+                    LruAppendTail(physicalBlockId);
+                }
+                else
+                {
+                    _blockPrefixHashes[physicalBlockId] = 0UL;
+                    _blockTokenCounts[physicalBlockId] = 0;
+                    _blockState[physicalBlockId] = StateFree;
+                    _freeStack[_freeCount++] = physicalBlockId;
+                }
             }
 
-            if (Interlocked.CompareExchange(ref _blockAllocatedState[physicalBlockId], 0, 1) == 1)
-            {
-                _freeBlocks.Push(physicalBlockId);
-            }
+            return remaining;
         }
-
-        return remaining;
     }
 
     /// <summary>

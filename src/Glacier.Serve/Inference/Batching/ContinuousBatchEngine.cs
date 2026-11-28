@@ -24,6 +24,19 @@ using Glacier.Tune.Sleep;
 
 namespace Glacier.Serve.Inference.Batching;
 
+public sealed class InferenceOverloadedException : InvalidOperationException
+{
+    public int StatusCode { get; }
+    public int RetryAfterSeconds { get; }
+
+    public InferenceOverloadedException(string message, int statusCode = 429, int retryAfterSeconds = 1)
+        : base(message)
+    {
+        StatusCode = statusCode;
+        RetryAfterSeconds = retryAfterSeconds;
+    }
+}
+
 /// <summary>
 /// Continuous Iteration-Level Batching Engine with PagedAttention.
 /// Dynamically admits pending requests, interleaves non-blocking chunked batched prefill
@@ -42,6 +55,8 @@ public sealed class ContinuousBatchEngine : IDisposable
     private readonly int _maxBatchSize;
     private readonly int _maxSeqLen;
     private readonly int _prefillChunkSize;
+    private readonly int _maxWaitingQueueSize;
+    private readonly int _maxHiddenHistoryPoolSize;
     private readonly int _defaultReasoningLoopMinPeriod;
     private readonly int _defaultMaxReasoningTokens;
     private readonly bool _enableSpeculativeDecoding;
@@ -58,11 +73,7 @@ public sealed class ContinuousBatchEngine : IDisposable
     private readonly ConcurrentDictionary<string, LoadedLoraEntry> _loraAdapters = new(StringComparer.Ordinal);
     private long _loraInstanceEpoch;
 
-    private readonly Channel<SequenceState> _waitingQueue = Channel.CreateUnbounded<SequenceState>(new UnboundedChannelOptions
-    {
-        SingleReader = true,
-        SingleWriter = false
-    });
+    private readonly Channel<SequenceState> _waitingQueue;
 
     private readonly List<SequenceState> _prefillingBatch = new(64);
     private readonly List<SequenceState> _activeBatch = new(64);
@@ -137,6 +148,7 @@ public sealed class ContinuousBatchEngine : IDisposable
     public int MaxBatchSize => _maxBatchSize;
     public int MaxSeqLen => _maxSeqLen;
     public int PrefillChunkSize => _prefillChunkSize;
+    public int MaxWaitingQueueSize => _maxWaitingQueueSize;
     public bool IsGpuAccelerated => _runner.IsGpuAccelerated;
     public string ActiveBackend => _runner.BackendName;
     public KvCachePrecision KvPrecision => _pool.Precision;
@@ -173,6 +185,41 @@ public sealed class ContinuousBatchEngine : IDisposable
         int maxDraftTokens = 4,
         int speculativeBatchThreshold = 4,
         string? mtpSidecarPath = null)
+        : this(
+            modelPath,
+            totalKvBlocks,
+            maxBatchSize,
+            maxSeqLen,
+            seed,
+            defaultReasoningLoopMinPeriod,
+            useGpu,
+            prefillChunkSize,
+            defaultMaxReasoningTokens,
+            kvCachePrecision,
+            enableSpeculativeDecoding,
+            maxDraftTokens,
+            speculativeBatchThreshold,
+            mtpSidecarPath,
+            maxWaitingQueueSize: 0)
+    {
+    }
+
+    public ContinuousBatchEngine(
+        string modelPath,
+        int totalKvBlocks,
+        int maxBatchSize,
+        int maxSeqLen,
+        int? seed,
+        int defaultReasoningLoopMinPeriod,
+        bool useGpu,
+        int prefillChunkSize,
+        int defaultMaxReasoningTokens,
+        KvCachePrecision kvCachePrecision,
+        bool enableSpeculativeDecoding,
+        int maxDraftTokens,
+        int speculativeBatchThreshold,
+        string? mtpSidecarPath,
+        int maxWaitingQueueSize)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(modelPath);
         ArgumentOutOfRangeException.ThrowIfLessThan(totalKvBlocks, 1);
@@ -181,6 +228,7 @@ public sealed class ContinuousBatchEngine : IDisposable
         ArgumentOutOfRangeException.ThrowIfLessThan(prefillChunkSize, 1);
         ArgumentOutOfRangeException.ThrowIfNegative(maxDraftTokens);
         ArgumentOutOfRangeException.ThrowIfLessThan(speculativeBatchThreshold, 1);
+        ArgumentOutOfRangeException.ThrowIfNegative(maxWaitingQueueSize);
 
         _gguf = GgufFile.Open(modelPath);
         try
@@ -191,6 +239,14 @@ public sealed class ContinuousBatchEngine : IDisposable
             _maxBatchSize = maxBatchSize;
             _maxSeqLen = maxSeqLen;
             _prefillChunkSize = prefillChunkSize;
+            _maxWaitingQueueSize = maxWaitingQueueSize > 0 ? maxWaitingQueueSize : Math.Max(64, maxBatchSize * 8);
+            _maxHiddenHistoryPoolSize = Math.Max(4, maxBatchSize * 2);
+            _waitingQueue = Channel.CreateBounded<SequenceState>(new BoundedChannelOptions(_maxWaitingQueueSize)
+            {
+                SingleReader = true,
+                SingleWriter = false,
+                FullMode = BoundedChannelFullMode.Wait
+            });
             _defaultReasoningLoopMinPeriod = defaultReasoningLoopMinPeriod;
             _defaultMaxReasoningTokens = defaultMaxReasoningTokens;
             _enableSpeculativeDecoding = enableSpeculativeDecoding;
@@ -512,6 +568,14 @@ public sealed class ContinuousBatchEngine : IDisposable
         int requestedMaxTokens = request.EffectiveMaxTokens > 0 ? request.EffectiveMaxTokens : 256;
         int effectiveMaxNewTokens = Math.Min(requestedMaxTokens, _maxSeqLen - promptTokens.Length);
 
+        if (_pool.FreeBlocksCount == 0 && ActiveBatchSize > 0)
+        {
+            throw new InferenceOverloadedException(
+                "KV cache block pool is temporarily exhausted. Please retry shortly.",
+                statusCode: 503,
+                retryAfterSeconds: 1);
+        }
+
         string reqId = $"req-{Guid.NewGuid():N}";
         var blockTable = new BlockTable(_pool);
         bool captureHiddenStates = _mtpConfigured && RunnerSupportsHiddenStateForSequence(loraEntry?.Weights);
@@ -583,14 +647,13 @@ public sealed class ContinuousBatchEngine : IDisposable
 
             Interlocked.Increment(ref _waitingCount);
             _sleepDaemon?.RecordActivity();
-            try
-            {
-                await _waitingQueue.Writer.WriteAsync(state, ct);
-            }
-            catch
+            if (!_waitingQueue.Writer.TryWrite(state))
             {
                 Interlocked.Decrement(ref _waitingCount);
-                throw;
+                throw new InferenceOverloadedException(
+                    $"Inference waiting queue capacity ({_maxWaitingQueueSize}) reached. Please retry shortly.",
+                    statusCode: 429,
+                    retryAfterSeconds: 1);
             }
         }
         catch
@@ -601,7 +664,7 @@ public sealed class ContinuousBatchEngine : IDisposable
             }
             else
             {
-                if (rentedHidden != null)
+                if (rentedHidden != null && _hiddenHistoryPool.Count < _maxHiddenHistoryPoolSize)
                     _hiddenHistoryPool.Push(rentedHidden);
                 blockTable.ReleaseAll();
             }
@@ -638,7 +701,7 @@ public sealed class ContinuousBatchEngine : IDisposable
                 ReadOnlySpan<int> blockTokens = promptTokens.AsSpan(b * blockSize, blockSize);
                 ulong blockHash = PagedBlockPool.ComputePrefixHash(runningHash, blockTokens);
                 if (blockHash == 0UL) blockHash = 1UL;
-                if (_pool.TryFindPrefixBlock(blockHash, out int pBlockId))
+                if (_pool.TryFindPrefixBlock(blockHash, blockTokens, out int pBlockId))
                 {
                     pendingBlockId = pBlockId;
                     runningHash = blockHash;
@@ -1329,52 +1392,139 @@ public sealed class ContinuousBatchEngine : IDisposable
 
     private void ExecutePrefillChunkStep(float[] logitsBuffer)
     {
-        var seq = _prefillingBatch[0];
-        if (seq.CancellationToken.IsCancellationRequested)
-        {
-            CancelAndRecycleSequence(seq);
-            _prefillingBatch.RemoveAt(0);
+        SweepCancelledSequences(_prefillingBatch);
+        int prefillCount = _prefillingBatch.Count;
+        if (prefillCount == 0)
             return;
-        }
 
-        int promptLen = seq.PromptTokens.Length;
-        int startPos = seq.PrefilledTokens;
         int blockSize = _pool.BlockSize;
+        int remainingTickBudget = Math.Max(_prefillChunkSize, prefillCount);
+        int idx = 0;
 
-        if (startPos >= promptLen)
+        while (idx < _prefillingBatch.Count && remainingTickBudget > 0)
         {
-            // Fully cached prefix: evaluate final token to obtain logits for first token sampling
-            var hiddenCtx = _runner as IPagedHiddenStateContext;
-            hiddenCtx?.BindHiddenStateHistory(seq.HiddenStateHistory);
-            bool tokenOk = _runner.ForwardToken(
-                seq.PromptTokens[promptLen - 1],
-                promptLen - 1,
+            var seq = _prefillingBatch[idx];
+            if (seq.CancellationToken.IsCancellationRequested)
+            {
+                CancelAndRecycleSequence(seq);
+                _prefillingBatch.RemoveAt(idx);
+                continue;
+            }
+
+            int promptLen = seq.PromptTokens.Length;
+            int startPos = seq.PrefilledTokens;
+
+            if (startPos >= promptLen)
+            {
+                // Fully cached prefix: evaluate final token to obtain logits for first token sampling
+                var hiddenCtx = _runner as IPagedHiddenStateContext;
+                hiddenCtx?.BindHiddenStateHistory(seq.HiddenStateHistory);
+                bool tokenOk = _runner.ForwardToken(
+                    seq.PromptTokens[promptLen - 1],
+                    promptLen - 1,
+                    seq.BlockTable,
+                    _pool,
+                    logitsBuffer.AsSpan(),
+                    computeLogits: true,
+                    seq.LoraAdapter);
+                hiddenCtx?.BindHiddenStateHistory(null);
+
+                remainingTickBudget = Math.Max(0, remainingTickBudget - 1);
+
+                if (!tokenOk)
+                {
+                    seq.IsFinished = true;
+                    seq.FinishReason = "pool_oom";
+                    CompleteAndRecycleSequence(seq);
+                    _prefillingBatch.RemoveAt(idx);
+                    continue;
+                }
+
+                _prefillingBatch.RemoveAt(idx);
+                seq.IsPrefillDone = true;
+
+                if (seq.CancellationToken.IsCancellationRequested)
+                {
+                    CancelAndRecycleSequence(seq);
+                    continue;
+                }
+
+                ProcessSampledToken(seq, logitsBuffer.AsSpan(), isFirstToken: true);
+                if (seq.IsFinished)
+                {
+                    CompleteAndRecycleSequence(seq);
+                }
+                else
+                {
+                    _activeBatch.Add(seq);
+                }
+                continue;
+            }
+
+            int remainingSeqs = _prefillingBatch.Count - idx;
+            int fairShare = Math.Max(1, remainingTickBudget / remainingSeqs);
+            int seqBudget = Math.Min(fairShare, _prefillChunkSize);
+            int chunkLen = Math.Min(promptLen - startPos, seqBudget);
+            bool isFinalChunk = (startPos + chunkLen == promptLen);
+
+            var chunkHiddenCtx = _runner as IPagedHiddenStateContext;
+            chunkHiddenCtx?.BindHiddenStateHistory(seq.HiddenStateHistory);
+            bool ok = _runner.ForwardPrefillChunk(
+                seq.PromptTokens.AsSpan(startPos, chunkLen),
+                startPos,
                 seq.BlockTable,
                 _pool,
-                logitsBuffer.AsSpan(),
-                computeLogits: true,
+                isFinalChunk ? logitsBuffer.AsSpan() : Span<float>.Empty,
+                computeLogits: isFinalChunk,
                 seq.LoraAdapter);
-            hiddenCtx?.BindHiddenStateHistory(null);
+            chunkHiddenCtx?.BindHiddenStateHistory(null);
 
-            if (!tokenOk)
+            remainingTickBudget = Math.Max(0, remainingTickBudget - chunkLen);
+
+            if (!ok)
             {
                 seq.IsFinished = true;
                 seq.FinishReason = "pool_oom";
                 CompleteAndRecycleSequence(seq);
-                _prefillingBatch.RemoveAt(0);
-                return;
+                _prefillingBatch.RemoveAt(idx);
+                continue;
             }
 
-            _prefillingBatch.RemoveAt(0);
+            seq.PrefilledTokens += chunkLen;
+            seq.CurrentPos = seq.PrefilledTokens;
+
+            // Bind any newly completed full blocks into the token-verified prefix hash cache
+            int completedBlocks = seq.PrefilledTokens / blockSize;
+            while (seq.BoundPrefixBlocks < completedBlocks)
+            {
+                int blockIdx = seq.BoundPrefixBlocks;
+                ReadOnlySpan<int> blockTokens = seq.PromptTokens.AsSpan(blockIdx * blockSize, blockSize);
+                seq.LastPrefixHash = PagedBlockPool.ComputePrefixHash(seq.LastPrefixHash, blockTokens);
+                if (seq.LastPrefixHash == 0UL) seq.LastPrefixHash = 1UL;
+                int physicalId = seq.BlockTable.GetBlockId(blockIdx);
+                _pool.BindPrefixBlock(seq.LastPrefixHash, physicalId, blockTokens);
+                seq.BoundPrefixBlocks++;
+            }
+
+            if (!isFinalChunk)
+            {
+                // Advance to next sequence in _prefillingBatch so all queued prefills progress concurrently
+                idx++;
+                continue;
+            }
+
+            _prefillingBatch.RemoveAt(idx);
             seq.IsPrefillDone = true;
 
             if (seq.CancellationToken.IsCancellationRequested)
             {
                 CancelAndRecycleSequence(seq);
-                return;
+                continue;
             }
 
+            // Sample first generated token from the completed prefill logits (CurrentPos stays promptLen for first decode step)
             ProcessSampledToken(seq, logitsBuffer.AsSpan(), isFirstToken: true);
+
             if (seq.IsFinished)
             {
                 CompleteAndRecycleSequence(seq);
@@ -1383,74 +1533,6 @@ public sealed class ContinuousBatchEngine : IDisposable
             {
                 _activeBatch.Add(seq);
             }
-            return;
-        }
-
-        int chunkLen = Math.Min(promptLen - startPos, _prefillChunkSize);
-        bool isFinalChunk = (startPos + chunkLen == promptLen);
-
-        var chunkHiddenCtx = _runner as IPagedHiddenStateContext;
-        chunkHiddenCtx?.BindHiddenStateHistory(seq.HiddenStateHistory);
-        bool ok = _runner.ForwardPrefillChunk(
-            seq.PromptTokens.AsSpan(startPos, chunkLen),
-            startPos,
-            seq.BlockTable,
-            _pool,
-            isFinalChunk ? logitsBuffer.AsSpan() : Span<float>.Empty,
-            computeLogits: isFinalChunk,
-            seq.LoraAdapter);
-        chunkHiddenCtx?.BindHiddenStateHistory(null);
-
-        if (!ok)
-        {
-            seq.IsFinished = true;
-            seq.FinishReason = "pool_oom";
-            CompleteAndRecycleSequence(seq);
-            _prefillingBatch.RemoveAt(0);
-            return;
-        }
-
-        seq.PrefilledTokens += chunkLen;
-        seq.CurrentPos = seq.PrefilledTokens;
-
-        // Bind any newly completed full blocks into the prefix hash cache
-        int completedBlocks = seq.PrefilledTokens / blockSize;
-        while (seq.BoundPrefixBlocks < completedBlocks)
-        {
-            int blockIdx = seq.BoundPrefixBlocks;
-            ReadOnlySpan<int> blockTokens = seq.PromptTokens.AsSpan(blockIdx * blockSize, blockSize);
-            seq.LastPrefixHash = PagedBlockPool.ComputePrefixHash(seq.LastPrefixHash, blockTokens);
-            if (seq.LastPrefixHash == 0UL) seq.LastPrefixHash = 1UL;
-            int physicalId = seq.BlockTable.GetBlockId(blockIdx);
-            _pool.BindPrefixBlock(seq.LastPrefixHash, physicalId);
-            seq.BoundPrefixBlocks++;
-        }
-
-        if (!isFinalChunk)
-        {
-            // Keep sequence in _prefillingBatch so active decodes can run on the very next tick
-            return;
-        }
-
-        _prefillingBatch.RemoveAt(0);
-        seq.IsPrefillDone = true;
-
-        if (seq.CancellationToken.IsCancellationRequested)
-        {
-            CancelAndRecycleSequence(seq);
-            return;
-        }
-
-        // Sample first generated token from the completed prefill logits (CurrentPos stays promptLen for first decode step)
-        ProcessSampledToken(seq, logitsBuffer.AsSpan(), isFirstToken: true);
-
-        if (seq.IsFinished)
-        {
-            CompleteAndRecycleSequence(seq);
-        }
-        else
-        {
-            _activeBatch.Add(seq);
         }
     }
 
@@ -1720,8 +1802,9 @@ public sealed class ContinuousBatchEngine : IDisposable
         {
             seq.BlockTable.ReleaseAll();
         }
-        catch (ObjectDisposedException)
+        catch (ObjectDisposedException ex)
         {
+            GlacierDiagnostics.LogDebug($"[ContinuousBatchEngine] BlockTable release on disposed pool during cancel: {ex.Message}");
         }
         seq.TokenChannel.Writer.TryComplete();
         if (seq.CancellationToken.IsCancellationRequested)
@@ -1776,7 +1859,8 @@ public sealed class ContinuousBatchEngine : IDisposable
         }
         if (seq.HiddenStateHistory != null)
         {
-            _hiddenHistoryPool.Push(seq.HiddenStateHistory);
+            if (_hiddenHistoryPool.Count < _maxHiddenHistoryPoolSize)
+                _hiddenHistoryPool.Push(seq.HiddenStateHistory);
             seq.HiddenStateHistory = null;
         }
     }
@@ -1824,8 +1908,9 @@ public sealed class ContinuousBatchEngine : IDisposable
         {
             seq.BlockTable.ReleaseAll();
         }
-        catch (ObjectDisposedException)
+        catch (ObjectDisposedException ex)
         {
+            GlacierDiagnostics.LogDebug($"[ContinuousBatchEngine] BlockTable release on disposed pool during cancel: {ex.Message}");
         }
         seq.TokenChannel.Writer.TryComplete();
         string completedText = seq.GeneratedTextBuilder.ToString();

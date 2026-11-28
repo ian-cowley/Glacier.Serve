@@ -122,11 +122,22 @@ public unsafe class PrefixHashKvCacheTests
         pool.ReleaseBlock(blockId);
         Assert.Equal(1, pool.GetRefCount(blockId));
 
-        // Second sequence releases its reference
+        // Second sequence releases its reference: block stays in LRU prefix cache while still counted as free/evictable capacity
         pool.ReleaseBlock(foundBlockId);
         Assert.Equal(0, pool.GetRefCount(blockId));
+        Assert.Equal(16, pool.FreeBlocksCount);
+        Assert.Equal(1, pool.CachedPrefixBlocksCount);
 
-        // Block has been returned to pool and purged from prefix map
+        // Cross-request LRU cache hit resurrects the cached block with refCount == 1
+        Assert.True(pool.TryFindPrefixBlock(hash, out int resurrectedId));
+        Assert.Equal(blockId, resurrectedId);
+        Assert.Equal(1, pool.GetRefCount(blockId));
+        Assert.Equal(15, pool.FreeBlocksCount);
+        Assert.Equal(0, pool.CachedPrefixBlocksCount);
+        pool.ReleaseBlock(resurrectedId);
+
+        // Explicit cache eviction purges unreferenced LRU entries
+        Assert.Equal(1, pool.EvictPrefixCache());
         Assert.False(pool.TryFindPrefixBlock(hash, out _));
         Assert.Equal(16, pool.FreeBlocksCount);
     }

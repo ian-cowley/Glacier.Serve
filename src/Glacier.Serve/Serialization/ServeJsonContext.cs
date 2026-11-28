@@ -289,6 +289,12 @@ public sealed class TensorDto
     [JsonPropertyName("data")] public float[] Data { get; set; } = [];
 }
 
+public sealed class HarnessDiagnosticPayload
+{
+    [JsonPropertyName("diagnostic_id")] public string? DiagnosticId { get; set; }
+    [JsonPropertyName("error")] public string? Error { get; set; }
+}
+
 [JsonSourceGenerationOptions(
     PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
     PropertyNameCaseInsensitive = true,
@@ -327,6 +333,7 @@ public sealed class TensorDto
 [JsonSerializable(typeof(ChatCompletionChunkResponse))]
 [JsonSerializable(typeof(ChatChunkChoice))]
 [JsonSerializable(typeof(ChatChunkDelta))]
+[JsonSerializable(typeof(HarnessDiagnosticPayload))]
 public partial class ServeJsonContext : JsonSerializerContext
 {
 }

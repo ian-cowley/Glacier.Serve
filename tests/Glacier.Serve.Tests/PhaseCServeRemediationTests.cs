@@ -39,9 +39,10 @@ public sealed class PhaseCServeRemediationTests : IDisposable
                 if (File.Exists(path))
                     File.Delete(path);
             }
-            catch
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 // Best effort cleanup if Windows MMF handle release lags briefly
+                System.Diagnostics.Debug.WriteLine($"Temp GGUF cleanup skipped for '{path}': {ex.Message}");
             }
         }
     }
@@ -319,6 +320,7 @@ public sealed class PhaseCServeRemediationTests : IDisposable
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void CudaPagedTransformerRunner_GpuVsCpuParity_ChunkedPrefillAndMultiSeqBatchDecode()
     {
         if (!GpuContext.IsSupported)
@@ -1078,6 +1080,7 @@ public sealed class PhaseCServeRemediationTests : IDisposable
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void ContinuousBatchEngine_CudaSkipsDuplicateHostKvBuffers()
     {
         using (var metadataOnlyPool = new PagedBlockPool(totalBlocks: 32, layers: 4, headsKv: 2, headDim: 64, allocateHostBuffers: false))

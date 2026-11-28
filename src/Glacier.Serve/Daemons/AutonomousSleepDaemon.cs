@@ -5,6 +5,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
+using Glacier.Serve.Diagnostics;
 using Glacier.Tune.Sleep;
 
 /// <summary>
@@ -237,7 +238,14 @@ public sealed class AutonomousSleepDaemon : IDisposable, IAsyncDisposable
         if (_cts != null)
         {
             _cts.Cancel();
-            try { _daemonLoopTask?.Wait(TimeSpan.FromSeconds(2)); } catch { }
+            try
+            {
+                _daemonLoopTask?.Wait(TimeSpan.FromSeconds(2));
+            }
+            catch (Exception ex) when (ex is OperationCanceledException or AggregateException or ObjectDisposedException)
+            {
+                GlacierDiagnostics.LogDebug($"[AutonomousSleepDaemon] Stop wait completed: {ex.Message}");
+            }
             _cts.Dispose();
             _cts = null;
             _daemonLoopTask = null;
@@ -263,7 +271,14 @@ public sealed class AutonomousSleepDaemon : IDisposable, IAsyncDisposable
                 _cts.Cancel();
                 if (_daemonLoopTask != null)
                 {
-                    try { await _daemonLoopTask; } catch { }
+                    try
+                    {
+                        await _daemonLoopTask;
+                    }
+                    catch (OperationCanceledException ex)
+                    {
+                        GlacierDiagnostics.LogDebug($"[AutonomousSleepDaemon] DisposeAsync cancelled: {ex.Message}");
+                    }
                 }
                 _cts.Dispose();
                 _cts = null;

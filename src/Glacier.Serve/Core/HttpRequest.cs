@@ -7,10 +7,20 @@ using Glacier.Serve.Routing;
 
 public sealed class HttpRequest
 {
+    public HttpRequest()
+    {
+        Headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    internal HttpRequest(Dictionary<string, string> headers)
+    {
+        Headers = headers;
+    }
+
     public HttpMethod Method { get; set; }
     public string Path { get; set; } = "/";
     public string QueryString { get; set; } = string.Empty;
-    public Dictionary<string, string> Headers { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, string> Headers { get; set; }
     public Dictionary<string, string> RouteParams { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public PipeReader BodyReader { get; set; } = null!;
     public ReadOnlyMemory<byte> Body { get; set; } = ReadOnlyMemory<byte>.Empty;
